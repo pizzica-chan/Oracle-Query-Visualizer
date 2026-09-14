@@ -172,6 +172,40 @@ describe('query-effect', () => {
     expect(lineTexts(jpScope).some((l) => l.includes('LEFT JOIN'))).toBe(true);
   });
 
+  it('旧式外部結合 (+) の結合条件は行の絞り込みに出さない', () => {
+    const sql = 'SELECT e.emp_no FROM employees e, departments d WHERE e.dept_no = d.dept_no(+)';
+    const result = parseOracleQuery(sql);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+
+    // 結合条件しか無いので絞り込みの節そのものが立たない（ANSI で ON に書いた場合と揃う）
+    for (const mode of ['japanese', 'sql'] as const) {
+      const filter = buildQueryEffect(result.query, mode).sections.find((s) => s.kind === 'filter');
+      const texts = JSON.stringify(filter ?? null);
+      expect(texts).not.toContain('e.dept_no');
+    }
+  });
+
+  it('旧式外部結合 (+) でも本物の絞り込みは残す', () => {
+    const sql = `SELECT a.id
+FROM t_a a, t_b b
+WHERE a.id = b.a_id(+)
+  AND b.status(+) = 'ACTIVE'
+  AND a.kind = 'X'`;
+    const result = parseOracleQuery(sql);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+
+    const filter = buildQueryEffect(result.query, 'japanese').sections.find(
+      (s) => s.kind === 'filter',
+    );
+    const texts = JSON.stringify(filter ?? null);
+    expect(texts).toContain("a.kind = 'X'");
+    // 結合条件（(+) 付きの絞り込みを含む）は検索範囲側に出るので二重表示しない
+    expect(texts).not.toContain('a.id = b.a_id');
+    expect(texts).not.toContain('b.status');
+  });
+
   it('CROSS JOIN に ON があるときは直積ではなく結合条件として説明する', () => {
     const sql = `
       SELECT u.id

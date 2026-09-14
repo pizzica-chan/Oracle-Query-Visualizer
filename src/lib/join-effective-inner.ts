@@ -276,6 +276,34 @@ function joinDerivedConditionIds(joins: JoinEdge[]): Set<string> {
 }
 
 /**
+ * 結合条件として表示済みのノードを WHERE ツリーから取り除く。
+ *
+ * 旧式 `(+)` は結合条件が WHERE に残るため、そのまま描くと「行の絞り込み」へ結合条件が
+ * 並んでしまう（ANSI なら ON 句にあり出てこない）。AND / OR は子が減った結果 1 件なら畳む。
+ */
+export function conditionTreeWithoutJoinConditions(
+  where: ConditionNode | undefined,
+  joins: JoinEdge[],
+): ConditionNode | undefined {
+  if (!where) return undefined;
+  const excluded = joinDerivedConditionIds(joins);
+  if (excluded.size === 0) return where;
+
+  const prune = (node: ConditionNode): ConditionNode | undefined => {
+    if (excluded.has(node.id)) return undefined;
+    if (node.type !== 'and' && node.type !== 'or') return node;
+    const children = (node.children ?? [])
+      .map(prune)
+      .filter((child): child is ConditionNode => child !== undefined);
+    if (children.length === 0) return undefined;
+    if (children.length === 1) return children[0];
+    return { ...node, children };
+  };
+
+  return prune(where);
+}
+
+/**
  * `(+)` が付いた側がこのテーブルを指す比較か。
  *
  * Oracle は `b.fiscal_year(+) = 2024` を結合条件の一部として扱い、未結合行を残す

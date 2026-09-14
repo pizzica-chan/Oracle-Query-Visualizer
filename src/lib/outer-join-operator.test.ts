@@ -97,15 +97,29 @@ WHERE a.id = b.a_id(+)
   });
 
   describe('結合条件にならない (+)', () => {
-    it('リテラルとの比較に付いた (+) は JOIN にしない（外部結合側の絞り込み）', () => {
+    it('リテラルとの比較に付いた (+) は辺を増やさず既存の結合条件へ畳み込む', () => {
       const result = expectParseOk(`SELECT a.id
 FROM t_a a, t_b b
 WHERE a.id = b.a_id(+)
   AND b.status(+) = 'ACTIVE'`);
       if (!result.success) return;
 
+      // Oracle は ON 句相当として扱うので、辺は増やさず結合条件に含める
       expect(result.query.joins).toHaveLength(1);
+      expect(result.query.joins[0]?.type).toBe('LEFT JOIN');
+      expect(result.query.joins[0]?.condition).toContain("b.status(+) = 'ACTIVE'");
       expect(result.query.where).toBeDefined();
+    });
+
+    it('(+) が無いリテラル比較は結合条件へ畳み込まない', () => {
+      const result = expectParseOk(`SELECT a.id
+FROM t_a a, t_b b
+WHERE a.id = b.a_id(+)
+  AND b.status = 'ACTIVE'`);
+      if (!result.success) return;
+
+      expect(result.query.joins).toHaveLength(1);
+      expect(result.query.joins[0]?.condition).not.toContain('b.status');
     });
 
     it('OR の下の結合条件は JOIN にしない（AND 連結のみ結合として扱う）', () => {

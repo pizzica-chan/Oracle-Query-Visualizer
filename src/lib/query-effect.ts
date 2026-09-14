@@ -2,6 +2,7 @@ import type { ConditionNode, JoinEdge, ParsedQuery, SelectColumn, SetClause, Sou
 import { formatJoinDisplayType } from './parser';
 import { getUpdateTargetTables } from './query-utils';
 import {
+  conditionTreeWithoutJoinConditions,
   effectiveInnerAnalysisByJoinId,
   formatEffectiveInnerJoinScopeLine,
   isInnerLikeJoin,
@@ -941,12 +942,14 @@ function joinFilterPart(joinLeaves: ConditionEffectNode[]): QueryEffectFilterPar
 }
 
 function describeRowFilterSection(query: ParsedQuery, mode: QueryEffectMode): QueryEffectSection | null {
+  const rowFilter = conditionTreeWithoutJoinConditions(query.where, query.joins);
+
   if (mode === 'japanese') {
-    if (!query.where) return null;
+    if (!rowFilter) return null;
     return {
       kind: 'filter',
       title: ROW_FILTER_TITLE_JA,
-      conditionRoot: buildConditionEffectTree(query.where, mode),
+      conditionRoot: buildConditionEffectTree(rowFilter, mode),
     };
   }
 
@@ -957,10 +960,10 @@ function describeRowFilterSection(query: ParsedQuery, mode: QueryEffectMode): Qu
   const joinPart = joinFilterPart(joinLeaves);
   if (joinPart) filterParts.push(joinPart);
 
-  if (query.where) {
+  if (rowFilter) {
     filterParts.push({
       label: 'WHERE',
-      root: buildConditionEffectTree(query.where, mode),
+      root: buildConditionEffectTree(rowFilter, mode),
     });
   }
 
@@ -1171,7 +1174,9 @@ function primaryTarget(query: ParsedQuery): string {
 
 function buildSummary(query: ParsedQuery, meta: (typeof ACTION_LABELS)[ParsedQuery['statementType']]): string {
   const target = primaryTarget(query);
-  const filtered = query.where ? '、WHERE 条件を満たす' : '';
+  const filtered = conditionTreeWithoutJoinConditions(query.where, query.joins)
+    ? '、WHERE 条件を満たす'
+    : '';
   const distinct = query.statementType === 'SELECT' && query.distinct ? '（重複行除外）' : '';
   const grouped =
     query.statementType === 'SELECT' && query.groupBy.length > 0

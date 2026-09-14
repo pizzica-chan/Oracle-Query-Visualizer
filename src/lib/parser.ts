@@ -1151,6 +1151,39 @@ function groupJoinConditions(
   return [...groups.values()].sort((a, b) => a.targetIndex - b.targetIndex || a.sourceIndex - b.sourceIndex);
 }
 
+/**
+ * `b.fiscal_year(+) = 2024` のような (+) 付きの片側条件を、その表を補われる側に持つ結合へ足す。
+ * Oracle はこれを結合条件の一部として扱う（ANSI の `ON … AND b.fiscal_year = 2024` 相当）ので、
+ * 行の絞り込みではなく結合条件として見せる
+ */
+function attachOuterJoinFilters(
+  conditions: ConditionNode[],
+  tables: TableRef[],
+  groups: DerivedJoinGroup[],
+): void {
+  if (groups.length === 0) return;
+
+  for (const node of conditions) {
+    if (!node.outerJoinSide) continue;
+    if (node.type !== 'comparison' && node.type !== 'like') continue;
+
+    const leftIndex = tableIndexOfExpression(node.left, tables);
+    const rightIndex = tableIndexOfExpression(node.right, tables);
+    // 両辺が表を指すものは結合条件として groupJoinConditions が既に取り込んでいる
+    if (leftIndex >= 0 && rightIndex >= 0) continue;
+
+    const markedIndex = node.outerJoinSide === 'left' ? leftIndex : rightIndex;
+    if (markedIndex < 0) continue;
+
+    const group = groups.find(
+      (g) =>
+        (g.optionalSide === 'source' && g.sourceIndex === markedIndex) ||
+        (g.optionalSide === 'target' && g.targetIndex === markedIndex),
+    );
+    if (group) group.nodes.push(node);
+  }
+}
+
 function combineConditionNodes(nodes: ConditionNode[]): ConditionNode {
   if (nodes.length === 1) return nodes[0]!;
   return {
@@ -1174,7 +1207,9 @@ function deriveJoinsFromWhere(
   if (commaJoinedIndexes.length === 0) return [];
 
   const eligible = new Set(commaJoinedIndexes);
-  const groups = groupJoinConditions(collectAndedConditions(where), tables, eligible);
+  const conditions = collectAndedConditions(where);
+  const groups = groupJoinConditions(conditions, tables, eligible);
+  attachOuterJoinFilters(conditions, tables, groups);
   const joins: JoinEdge[] = [];
   const connected = new Set<number>();
 
