@@ -472,6 +472,53 @@ WHERE a.id = b.a_id(+)
         expect(normalized.joins[0]?.type).toBe('INNER JOIN');
       });
     });
+
+    describe('旧式外部結合 (+)', () => {
+      it('結合条件が WHERE に残っていても実質 INNER にしない', () => {
+        const query = parseSql(
+          'SELECT e.emp_no FROM employees e, departments d WHERE e.dept_no = d.dept_no(+)',
+        );
+        expect(query.joins[0]?.type).toBe('LEFT JOIN');
+        expect(analyzeEffectiveInnerJoins(query)).toHaveLength(0);
+      });
+
+      it('(+) 付きの定数比較は結合条件の一部なので絞り込みに数えない', () => {
+        const query = parseSql(`SELECT a.id
+FROM t_a a, t_b b
+WHERE a.id = b.a_id(+)
+  AND b.status(+) = 'ACTIVE'`);
+        expect(query.joins[0]?.type).toBe('LEFT JOIN');
+        expect(analyzeEffectiveInnerJoins(query)).toHaveLength(0);
+      });
+
+      it('(+) を付け忘れた絞り込みは実質 INNER として検出する', () => {
+        const query = parseSql(`SELECT a.id
+FROM t_a a, t_b b
+WHERE a.id = b.a_id(+)
+  AND b.status = 'ACTIVE'`);
+        const analysis = analysisForJoin(query, query.joins[0]!.id);
+        expect(analysis).toBeDefined();
+        expect(analysis!.reasons.some((r) => r.kind === 'where' && r.label.includes('b.status'))).toBe(
+          true,
+        );
+      });
+
+      it('複数の (+) 結合を持つサンプルで両方 LEFT JOIN のまま残る', () => {
+        const query = parseSql(`SELECT e.emp_no, NVL(b.bonus_amount, 0) AS bonus_amount
+FROM employees e, departments d, employees m, bonuses b
+WHERE e.dept_no = d.dept_no
+  AND e.manager_no = m.emp_no(+)
+  AND e.emp_no = b.emp_no(+)
+  AND b.fiscal_year(+) = 2024
+  AND d.location IN ('TOKYO', 'OSAKA')
+  AND e.hired_at >= TO_DATE('2015-04-01', 'YYYY-MM-DD')
+ORDER BY d.dept_name, e.emp_no`);
+        expect(analyzeEffectiveInnerJoins(query)).toHaveLength(0);
+        expect(normalizeEffectiveInnerJoins(query).joins.filter((j) => j.type === 'LEFT JOIN')).toHaveLength(
+          2,
+        );
+      });
+    });
   });
 
   describe('formatEffectiveInnerCausePhrase', () => {

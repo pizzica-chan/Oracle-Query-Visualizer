@@ -254,7 +254,46 @@ function expressionOnlyReferencesTableViaNullCoalescing(
   return refs.every((pos) => spans.some((span) => pos >= span.start && pos < span.end));
 }
 
-function isNullRejectingLeaf(node: ConditionNode, identifiers: string[]): boolean {
+/**
+ * WHERE 由来の結合（旧式 `(+)`）へ取り込まれた条件ノードの id。
+ *
+ * ANSI では結合条件は ON 句にあるので WHERE を走査しても出てこないが、`(+)` では
+ * `WHERE e.dept_no = d.dept_no(+)` のように WHERE に残ったままで JoinEdge が組まれる。
+ * 除外しないと、その結合自身の結合条件を「NULL 行を弾く絞り込み」と読んでしまう。
+ */
+function joinDerivedConditionIds(joins: JoinEdge[]): Set<string> {
+  const ids = new Set<string>();
+  const walk = (node: ConditionNode | undefined): void => {
+    if (!node) return;
+    ids.add(node.id);
+    for (const child of node.children ?? []) walk(child);
+  };
+  for (const join of joins) {
+    if (!join.fromWhereClause) continue;
+    walk(join.conditionRoot);
+  }
+  return ids;
+}
+
+/**
+ * `(+)` が付いた側がこのテーブルを指す比較か。
+ *
+ * Oracle は `b.fiscal_year(+) = 2024` を結合条件の一部として扱い、未結合行を残す
+ * （ANSI の `LEFT JOIN b ON … AND b.fiscal_year = 2024` 相当）。絞り込みとして数えない。
+ */
+function isOuterJoinMarkedForTable(node: ConditionNode, identifiers: string[]): boolean {
+  if (!node.outerJoinSide) return false;
+  const marked = node.outerJoinSide === 'left' ? node.left : node.right;
+  return !!marked && expressionReferencesTable(marked, identifiers);
+}
+
+function isNullRejectingLeaf(
+  node: ConditionNode,
+  identifiers: string[],
+  joinDerivedIds: Set<string>,
+): boolean {
+  if (joinDerivedIds.has(node.id)) return false;
+  if (isOuterJoinMarkedForTable(node, identifiers)) return false;
   if (isNullPreservingCondition(node)) return false;
   if (!NULL_REJECTING_CONDITION_TYPES.has(node.type)) return false;
 
@@ -277,28 +316,29 @@ function collectConditionReasons(
   kind: 'where' | 'having',
   identifiers: string[],
   underOr: boolean,
+  joinDerivedIds: Set<string>,
 ): EffectiveInnerReason[] {
   if (!node) return [];
 
   if (node.type === 'or') {
     return (node.children ?? []).flatMap((child) =>
-      collectConditionReasons(child, kind, identifiers, true),
+      collectConditionReasons(child, kind, identifiers, true, joinDerivedIds),
     );
   }
 
   if (node.type === 'and') {
     return (node.children ?? []).flatMap((child) =>
-      collectConditionReasons(child, kind, identifiers, underOr),
+      collectConditionReasons(child, kind, identifiers, underOr, joinDerivedIds),
     );
   }
 
   if (node.type === 'not') {
     return (node.children ?? []).flatMap((child) =>
-      collectConditionReasons(child, kind, identifiers, underOr),
+      collectConditionReasons(child, kind, identifiers, underOr, joinDerivedIds),
     );
   }
 
-  if (underOr || !isNullRejectingLeaf(node, identifiers)) return [];
+  if (underOr || !isNullRejectingLeaf(node, identifiers, joinDerivedIds)) return [];
 
   const prefix = kind === 'where' ? 'WHERE' : 'HAVING';
   return [{ kind, label: `${prefix}: ${node.label}` }];
@@ -340,19 +380,21 @@ function reasonsForNullableTable(
   query: ParsedQuery,
   joinIndex: number,
   nullableTable: TableRef,
+  joinDerivedIds: Set<string>,
 ): EffectiveInnerReason[] {
   const identifiers = tableReferenceIdentifiers(nullableTable, query.tables);
   if (identifiers.length === 0) return [];
 
   return dedupeReasons([
     ...findSubsequentInnerJoinReasons(query.joins, query.tables, joinIndex, identifiers),
-    ...collectConditionReasons(query.where, 'where', identifiers, false),
-    ...collectConditionReasons(query.having, 'having', identifiers, false),
+    ...collectConditionReasons(query.where, 'where', identifiers, false, joinDerivedIds),
+    ...collectConditionReasons(query.having, 'having', identifiers, false, joinDerivedIds),
   ]);
 }
 
 export function analyzeEffectiveInnerJoins(query: ParsedQuery): EffectiveInnerAnalysis[] {
   const results: EffectiveInnerAnalysis[] = [];
+  const joinDerivedIds = joinDerivedConditionIds(query.joins);
 
   query.joins.forEach((join, joinIndex) => {
     if (!isOuterJoinWithNullableSide(join.type)) return;
@@ -364,7 +406,7 @@ export function analyzeEffectiveInnerJoins(query: ParsedQuery): EffectiveInnerAn
     const nullableTableIds: string[] = [];
 
     for (const nullableTable of sideTables) {
-      const tableReasons = reasonsForNullableTable(query, joinIndex, nullableTable);
+      const tableReasons = reasonsForNullableTable(query, joinIndex, nullableTable, joinDerivedIds);
       if (tableReasons.length === 0) continue;
       nullableTableIds.push(nullableTable.id);
       reasons.push(...tableReasons);

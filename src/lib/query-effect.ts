@@ -638,7 +638,9 @@ function describeJoinJapanese(
   const sourcesText = sourceLabels.join('、');
   const right = tableName(join, tables, join.targetId);
   const left = sourceLabels.length === 1 ? sourceLabels[0]! : sourcesText;
-  const joinType = formatJoinDisplayType(join);
+  // 文面は結合の意味で選ぶ。`LEFT JOIN（(+)）` や `NATURAL LEFT JOIN` のような装飾付き表示名で
+  // 引くと JOIN_SCOPE に載らず汎用 JOIN 文へ落ち、「左側は残る」という外部結合の意味が消える
+  const joinType = join.type;
   const condition = join.condition;
 
   if (effectiveInner) {
