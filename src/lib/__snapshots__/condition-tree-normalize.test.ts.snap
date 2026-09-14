@@ -1,0 +1,9 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`normalizeConditionTree > 下流処理との互換 > SAMPLE_SQL の実質 INNER JOIN 分析結果は変わらない 1`] = `
+[
+  "HAVING: SUM(oi.quantity) > (SELECT ... AS avg_items)",
+  "INNER JOIN products（p）",
+  "WHERE: oi.quantity BETWEEN 1 AND 10",
+]
+`;

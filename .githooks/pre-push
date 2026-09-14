@@ -1,0 +1,4 @@
+#!/bin/sh
+# push 前に dist/ が最新ビルドと一致するか確認する
+cd "$(dirname "$0")/.." || exit 1
+npm run ensure-dist

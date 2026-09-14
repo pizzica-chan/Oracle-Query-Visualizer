@@ -1,0 +1,40 @@
+---
+description: git push 前に dist/ を最新ビルドに同期する（このプロジェクト専用）
+alwaysApply: true
+---
+
+# dist 同梱ルール（push 前）
+
+このリポジトリは **`dist/`（index.html + assets/）** を Git 管理し、ビルド環境のない利用者が `file://` でオフライン利用できるようにしている。  
+**リモートへ push するときは、必ず `dist/` が最新ソースのビルド結果と一致していること。**
+
+## エージェントが push を依頼されたとき
+
+1. `npm run build` を実行する（または `npm run ensure-dist`）
+2. `git status dist/` で `dist/` に差分があれば、**ソースと一緒に `dist/` もコミット**する
+3. コミット後に push する
+
+push だけ依頼され、ソースに未コミット変更がある場合も同様にビルド → `dist/` 確認 → 必要ならコミット → push。
+
+## 利用者向け（手動 push）
+
+初回のみフックを有効化:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+以降、`git push` 時に `pre-push` が `npm run ensure-dist` を実行し、`dist/` が古ければ push を中止する。
+
+## チェック内容
+
+- `GITHUB_PAGES` **未設定**で `npm run build` し、`dist/` を再生成
+- `dist/` が **file:// 直開き向け**（`./assets/app.js`・CSS インライン・Pages 用 base パスなし）であることを検証
+- 生成結果が **HEAD の `dist/`** と一致しない場合はエラー  
+  → `dist/` をコミットしてから再度 push
+
+## 禁止
+
+- ソースだけコミットして **`dist/` を古いまま push しない**
+- **`GITHUB_PAGES=true` のビルド結果を `dist/` にコミットしない**（GitHub Pages デプロイは Actions が別途ビルドする）
+- push 前のビルド確認を省略しない

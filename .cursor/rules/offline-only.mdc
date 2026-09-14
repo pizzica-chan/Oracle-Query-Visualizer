@@ -1,0 +1,68 @@
+---
+description: 完全オフライン動作を維持するための開発制約（このプロジェクト専用）
+alwaysApply: true
+---
+
+# 完全オフライン開発ルール
+
+Oracle Query Visualizer は **実行時（ビルド成果物の利用時）にインターネット通信を一切発生させない** クライアント完結型アプリである。この制約は機能追加・リファクタ・依存更新のすべてに優先する。
+
+## スコープ（重要）
+
+| フェーズ | インターネット | 説明 |
+|---|---|---|
+| **ビルド・開発環境のセットアップ** | ✅ OK | `npm install`、`npm run build`、npm registry からの依存取得 |
+| **アプリの実行時（`dist` / ブラウザ）** | ❌ 禁止 | エンドユーザーがオフラインでも使えること |
+
+「完全オフライン」は **配布・実行時** の話であり、開発者がビルドするためにネットワークを使うことは問題ない。
+
+## 必須原則
+
+1. **SQL解析・可視化はブラウザ内のみ** — 外部API・バックエンド・クラウドLLMへのSQL送信を禁止
+2. **実行時の外部リソース読み込み禁止** — CDN、Google Fonts、外部画像/JS/CSS、`<script src="https://...">` を使わない
+3. **外部通信コードを追加しない** — `fetch` / `axios` / `WebSocket` / 外部SDK（Analytics、Sentry等）を導入しない
+4. **フォントはローカル or OS標準** — `@font-face` を使う場合は `public/` に同梱。外部URL指定は禁止
+5. **依存追加は慎重に** — ランタイムで外部通信するライブラリは採用しない。追加前に通信の有無を確認する
+
+## 禁止例
+
+```html
+<!-- BAD: 外部フォント -->
+<link href="https://fonts.googleapis.com/..." rel="stylesheet" />
+<script src="https://cdn.jsdelivr.net/..."></script>
+```
+
+```typescript
+// BAD: 外部APIへのSQL送信
+await fetch('https://api.example.com/parse', { body: sql });
+
+// BAD: オンライン専用サービス
+import Analytics from '@vercel/analytics';
+```
+
+## 許可されるもの
+
+- **ビルド時・開発時のインターネット接続** — `npm install` / `npm run build` / npm registry・GitHub からの依存取得
+- 上記で取得した依存の **配布物へのバンドル**（実行時は外部に取りに行かない）
+- `localhost` 向けの開発サーバー（`vite dev` / `vite preview`）
+- `public/` 配下の **ローカル同梱** アセット
+
+## 実装時チェックリスト
+
+変更を入れる前に確認する:
+
+- [ ] HTML / CSS / TS / TSX に **実行時参照される** `http://` または `https://` がない（ビルド用スクリプト・CI設定は対象外）
+- [ ] 新機能がオフラインでも動作する（ネットワーク遮断を前提）
+- [ ] SQLやユーザー入力が外部に送信されない
+- [ ] README や起動手順が「オフライン利用可能」であることを壊していない
+
+## オフライン代替の選び方
+
+| やりたいこと | 採用 | 禁止 |
+|---|---|---|
+| フォント | `system-ui`, 同梱woff2 | Google Fonts CDN |
+| SQL解析 | `node-sql-parser`（既存） | 外部パースAPI |
+| 図表描画 | バンドル済みライブラリ | 外部ウィジェットCDN |
+| 設定保存 | `localStorage` | クラウド同期 |
+
+迷った場合は **通信なし・ローカル完結** の実装を選ぶ。
