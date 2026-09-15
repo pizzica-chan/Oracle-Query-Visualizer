@@ -11,7 +11,7 @@ Cursor と共通の恒久ルール。**全文は以下が正**（要点だけ下
 @.cursor/rules/dist-on-push.mdc
 
 - **実行時の外部通信は禁止** — `fetch` / CDN / 外部フォント / Analytics SDK を入れない。SQL やユーザー入力を外部へ送らない。`npm install` や `npm run build` でのネットワーク利用は問題ない（禁止なのは配布物の実行時）。
-- **push 前に `dist/` を同期** — `npm run ensure-dist` を通し、ソースと一緒に `dist/` もコミットする。`GITHUB_PAGES=true` のビルド結果は `dist/` にコミットしない。
+- **push 前に `dist/` を同期** — `npm run ensure-dist` を通し、ソースと一緒に `dist/` もコミットする。
 
 ## コマンド
 

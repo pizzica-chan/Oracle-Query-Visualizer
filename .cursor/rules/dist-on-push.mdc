@@ -28,13 +28,12 @@ git config core.hooksPath .githooks
 
 ## チェック内容
 
-- `GITHUB_PAGES` **未設定**で `npm run build` し、`dist/` を再生成
-- `dist/` が **file:// 直開き向け**（`./assets/app.js`・CSS インライン・Pages 用 base パスなし）であることを検証
+- `npm run build` し、`dist/` を再生成
+- `dist/` が **file:// 直開き向け**（`./assets/app.js`・CSS インライン・相対 base）であることを検証
 - 生成結果が **HEAD の `dist/`** と一致しない場合はエラー  
   → `dist/` をコミットしてから再度 push
 
 ## 禁止
 
 - ソースだけコミットして **`dist/` を古いまま push しない**
-- **`GITHUB_PAGES=true` のビルド結果を `dist/` にコミットしない**（GitHub Pages デプロイは Actions が別途ビルドする）
 - push 前のビルド確認を省略しない

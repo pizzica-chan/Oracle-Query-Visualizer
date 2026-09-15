@@ -3,11 +3,8 @@ import { resolve } from 'node:path';
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 
-/** GitHub Pages のプロジェクトサイト URL: /{repo}/ */
-const GITHUB_PAGES_REPO = 'Oracle-Query-Visualizer';
-/** true のときのみ Pages 向け base。リポジトリ同梱 dist/ は必ず false（通常 build） */
-const isGitHubPages = process.env.GITHUB_PAGES === 'true';
-const base = isGitHubPages ? `/${GITHUB_PAGES_REPO}/` : './';
+/** 配布物は file:// 直開きと Cloudflare の両方で動く相対パス */
+const base = './';
 
 function assetRelativePath(href: string): string {
   const assetsIndex = href.indexOf('assets/');
@@ -40,7 +37,7 @@ function fixDistHtml(): Plugin {
         throw new Error('[fix-dist-html] dist/index.html に JS 参照が見つかりません');
       }
 
-      const scriptSrc = isGitHubPages ? scriptMatch[1]! : './assets/app.js';
+      const scriptSrc = './assets/app.js';
       const scriptTag = `<script defer src="${scriptSrc}"></script>`;
       html = html.replace(scriptMatch[0], '');
       html = html.replace(/<div id="root"><\/div>/, `<div id="root"></div>\n    ${scriptTag}`);
