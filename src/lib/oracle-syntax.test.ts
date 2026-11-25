@@ -275,3 +275,78 @@ ORDER BY emp_no`);
     });
   });
 });
+
+describe('式の表示（元の SQL の書き方を残す）', () => {
+  const columnsOf = (sql: string): string[] => {
+    const result = expectParseOk(sql);
+    return result.success ? result.query.columns.map((c) => c.expression) : [];
+  };
+
+  it.each([
+    // 接頭辞と引用符を落とすと、DATE '2024-01-01' が引き算の式に、N'abc' が列名に見える
+    ["DATE '2024-01-01'", "DATE '2024-01-01'"],
+    ["TIMESTAMP '2024-01-01 00:00:00'", "TIMESTAMP '2024-01-01 00:00:00'"],
+    ["N'abc'", "N'abc'"],
+    // 前処理で二重にしたバックスラッシュを、元の 1 つに戻す
+    ["'C:\\temp\\'", "'C:\\temp\\'"],
+    ["'it''s'", "'it''s'"],
+    ['TRUE', 'TRUE'],
+    ['SUM(DISTINCT t.x)', 'SUM(DISTINCT t.x)'],
+    ['AVG(DISTINCT t.x)', 'AVG(DISTINCT t.x)'],
+    ['VARIANCE(t.x)', 'VARIANCE(t.x)'],
+    ['VARIANCE(DISTINCT t.x)', 'VARIANCE(DISTINCT t.x)'],
+  ])('%s', (expr, expected) => {
+    expect(columnsOf(`SELECT ${expr} AS v FROM t`)).toEqual([expected]);
+  });
+
+  it('バインド変数のコロンを落とさない', () => {
+    const result = expectParseOk('SELECT t.a FROM t WHERE t.id = :id');
+    if (!result.success) return;
+    expect(result.query.where?.label).toBe('t.id = :id');
+  });
+
+  it('行の値の括弧と、ALL / EXISTS のサブクエリの括弧を元の SQL どおりに出す', () => {
+    const result = expectParseOk(
+      'SELECT t.a FROM t WHERE (t.a, t.b) IN ((1, 2)) AND t.a > ALL (SELECT x FROM u) AND EXISTS (SELECT 1 FROM dual)',
+    );
+    if (!result.success) return;
+    expect(result.query.where?.children?.map((c) => c.label)).toEqual([
+      '(t.a, t.b) IN ((1, 2))',
+      't.a > ALL (SELECT 1列 FROM u)',
+      'EXISTS (SELECT 1列 FROM DUAL)',
+    ]);
+  });
+
+  it('パッケージやスキーマの修飾を関数名から落とさない', () => {
+    const result = expectParseOk("SELECT t.a FROM t WHERE pkg.f(t.a) = 'X'");
+    if (!result.success) return;
+    expect(result.query.where?.label).toBe("pkg.F(t.a) = 'X'");
+  });
+});
+
+describe('パーサーが読めない書き方の前処理', () => {
+  it('カタカナ・ひらがなを含む引用符なしの名前を読む', () => {
+    const sql = 'SELECT u.名前 FROM ユーザー u JOIN 受注2 o ON o.ユーザーID = u.ID';
+    const result = expectParseOk(sql);
+    if (!result.success) return;
+    expect(tableNames(result.query)).toEqual(['ユーザー', '受注2']);
+    expect(result.query.columns[0]?.expression).toBe('u.名前');
+    // 範囲は元の SQL の名前をちょうど指す
+    const span = result.query.tables[0]!.sourceSpan!;
+    expect(sql.slice(span.start, span.end)).toBe('ユーザー u');
+  });
+
+  it('UPDATE の SET a = DEFAULT を読み、比較の右の DEFAULT は書き換えない', () => {
+    const result = expectParseOk('UPDATE t SET a = DEFAULT, b = 1 WHERE id = 1');
+    if (!result.success) return;
+    expect(result.query.setClauses?.map((s) => s.label)).toEqual(['a = DEFAULT', 'b = 1']);
+  });
+
+  it('文字列の中の DISTINCT・VARIANCE・DEFAULT は書き換えない', () => {
+    const result = expectParseOk(
+      "SELECT 'SUM(DISTINCT x)' AS a, 'VARIANCE(y)' AS b FROM t WHERE t.c = 'SET a = DEFAULT'",
+    );
+    if (!result.success) return;
+    expect(result.query.columns.map((c) => c.expression)).toEqual(["'SUM(DISTINCT x)'", "'VARIANCE(y)'"]);
+  });
+});

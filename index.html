@@ -7,6 +7,23 @@
     <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <script>
+      // 最初の描画の前に配色（data-theme）を決める。app.js は defer で読み込むので実行が遅く、
+      // そこで決めるとライトテーマの利用者にダークが一瞬見える。
+      // 保存のキーと決め方は src/lib/theme.ts と同じにする（theme.test.ts で照合している）
+      (function () {
+        var preference = null;
+        try {
+          preference = window.localStorage.getItem('oracle-query-visualizer:theme:v1');
+        } catch (e) {}
+        var theme = preference === 'light' || preference === 'dark' ? preference : null;
+        if (!theme) {
+          var prefersDark = !window.matchMedia || window.matchMedia('(prefers-color-scheme: dark)').matches;
+          theme = prefersDark ? 'dark' : 'light';
+        }
+        document.documentElement.setAttribute('data-theme', theme);
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

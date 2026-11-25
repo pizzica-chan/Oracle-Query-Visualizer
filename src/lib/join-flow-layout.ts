@@ -3,6 +3,7 @@ import { MarkerType } from '@xyflow/react';
 import { effectiveInnerAnalysisByJoinId } from './join-effective-inner';
 import { formatJoinDisplayType } from './parser';
 import type { JoinEdge, JoinType, ParsedQuery, SourceSpan, TableRef } from './types';
+import { joinConditionDisplayText } from './join-condition';
 import { formatTableLabel } from './alias-resolver';
 import {
   computeJoinNodePositions,
@@ -37,6 +38,44 @@ export const JOIN_EDGE_COLORS: Record<JoinType, string> = {
 };
 
 const JOIN_COLORS = JOIN_EDGE_COLORS;
+
+/** 種別が分からない JOIN の線の色 */
+export const JOIN_EDGE_FALLBACK_COLOR = '#64748b';
+
+/**
+ * ライトテーマでの線の色（ダーク用の色 → ライト用の色）。
+ * ダーク用の淡い色は白い背景では薄くて読みにくいので、同じ色相で濃くする。
+ * CSS 変数にしないのは、React Flow が矢印マーカーの id に色の文字列を使うため（var(...) が id に入る）
+ */
+const LIGHT_JOIN_COLORS: Record<string, string> = {
+  '#6b9fd4': '#2f6db3',
+  '#7db88a': '#2c7f45',
+  '#d4b06a': '#9a6a0e',
+  '#a89fd4': '#5f4fb0',
+  '#d47a7a': '#b03f3f',
+  [JOIN_EDGE_FALLBACK_COLOR]: '#55657d',
+};
+
+/** JOIN の線・ラベルの色を配色に合わせる。ダークのときは元の色をそのまま返す */
+export function themedJoinColor(color: string, scheme: 'light' | 'dark'): string {
+  if (scheme === 'dark') return color;
+  return LIGHT_JOIN_COLORS[color.toLowerCase()] ?? color;
+}
+
+/** React Flow の辺の線・矢印の色を配色に合わせる */
+export function themedJoinEdge<T extends Edge>(edge: T, scheme: 'light' | 'dark'): T {
+  if (scheme === 'dark') return edge;
+  const stroke = edge.style?.stroke;
+  const marker = edge.markerEnd;
+  return {
+    ...edge,
+    style: typeof stroke === 'string' ? { ...edge.style, stroke: themedJoinColor(stroke, scheme) } : edge.style,
+    markerEnd:
+      marker && typeof marker === 'object' && marker.color
+        ? { ...marker, color: themedJoinColor(marker.color, scheme) }
+        : marker,
+  };
+}
 
 export interface JoinFlowEdgeData extends Record<string, unknown> {
   condition: string;
@@ -242,7 +281,7 @@ export function buildJoinFlowLayout(
   const edges: Edge[] = [];
   joins.forEach((j, joinIndex) => {
     const effectiveInner = isEffectiveInnerJoin(j.id, effectiveInnerByJoinId);
-    const baseColor = JOIN_COLORS[j.type] ?? '#64748b';
+    const baseColor = JOIN_COLORS[j.type] ?? JOIN_EDGE_FALLBACK_COLOR;
     const color = effectiveInner ? (JOIN_COLORS['INNER JOIN'] ?? baseColor) : baseColor;
     const sources = resolveJoinLayoutSources(j, tables);
     const anchorId = sources[sources.length - 1] ?? j.sourceId;
@@ -264,7 +303,7 @@ export function buildJoinFlowLayout(
         markerEnd: { type: MarkerType.ArrowClosed, color },
         interactionWidth: 24,
         data: {
-          condition: j.condition,
+          condition: joinConditionDisplayText(j.condition),
           joinType: formatJoinDisplayType(j),
           effectiveInner: isPrimary ? effectiveInner : false,
           compact,

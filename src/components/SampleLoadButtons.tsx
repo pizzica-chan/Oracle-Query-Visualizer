@@ -5,8 +5,6 @@ interface SampleLoadButtonsProps {
   onDelete: () => void;
   onLegacyJoin: () => void;
   onHierarchical: () => void;
-  /** welcome 画面などで SELECT を強調する */
-  highlightSelect?: boolean;
 }
 
 const SAMPLES = [
@@ -35,7 +33,6 @@ export function SampleLoadButtons({
   onDelete,
   onLegacyJoin,
   onHierarchical,
-  highlightSelect = false,
 }: SampleLoadButtonsProps) {
   const handlers = { onSelect, onUpdate, onUnion, onDelete, onLegacyJoin, onHierarchical };
 
@@ -47,9 +44,7 @@ export function SampleLoadButtons({
           <button
             key={sample.id}
             type="button"
-            className={`btn sample-load-btn${
-              highlightSelect && sample.id === 'select' ? ' btn--primary' : ' btn--ghost'
-            }`}
+            className="btn btn--ghost sample-load-btn"
             onClick={handlers[sample.handler]}
             title={sample.title}
           >

@@ -1,6 +1,6 @@
 import type { ConditionNode, JoinEdge, JoinType, ParsedQuery, TableRef } from './types';
-import { resolveJoinConditionExpression } from './join-condition';
-import { maskNonCode } from './sql-lex';
+import { NO_JOIN_CONDITION, joinConditionDisplayText, resolveJoinConditionExpression } from './join-condition';
+import { maskNonCode, readBalancedParenEnd } from './sql-lex';
 
 export interface EffectiveInnerReason {
   kind: 'inner_join' | 'where' | 'having';
@@ -16,16 +16,29 @@ export interface EffectiveInnerAnalysis {
   nullableTableIds: string[];
 }
 
-const NULL_REJECTING_CONDITION_TYPES = new Set<ConditionNode['type']>([
-  'comparison',
-  'between',
-  'in',
-  'like',
-  'function',
-  'exists',
-  'subquery',
-  'raw',
-]);
+/**
+ * NULL を受け取っても NULL 以外を返しうる構文。
+ * これを含む式は、nullable 側の列が NULL でも真になりうるので、NULL 行を除外する根拠にしない。
+ * 例: `CASE WHEN o.x IS NULL THEN 1 ELSE 0 END = 1`、`a.x IN (o.y, 1)`、`o.x || 'a' = 'a'`。
+ * Oracle の `||` は、片方が NULL でももう片方の値を返す（Oracle Database 23 SQL Language Reference
+ * 「Concatenation Operator」: null can result only from the concatenation of two null strings）。
+ * 関数（NVL・DECODE など）は、引数の位置まで見て別に判定する（referencesTableOnlyInsideNonPropagatingCalls）
+ */
+const NULL_SWALLOWING_RE = /\b(?:case|exists|select|is|in|or|and)\b|\|\|/i;
+
+/** 集約関数の呼び出し（Oracle Database 23 SQL Language Reference「Aggregate Functions」） */
+const AGGREGATE_CALL_RE =
+  /\b(?:count|sum|avg|min|max|stddev|stddev_pop|stddev_samp|variance|var_pop|var_samp|median|listagg|collect|corr|covar_pop|covar_samp|regr_\w+|approx_count_distinct|any_value|grouping|grouping_id)\s*\(/i;
+
+/**
+ * 値がすべて NULL のグループでも NULL を返さない集約。
+ * COUNT と REGR_COUNT は数か 0 を返す（「Aggregate Functions」: COUNT and REGR_COUNT never return null）。
+ * GROUPING と GROUPING_ID は NULL を無視しない集約として同じページに挙がっている
+ */
+const NON_NULL_AGGREGATE_CALL_RE = /\b(?:count|regr_count|grouping|grouping_id|approx_count_distinct)\s*\(/i;
+
+/** 両辺のどちらかが NULL でも真偽や値が決まる演算子。葉として来ても NULL 行を除外する根拠にしない */
+const NON_NULL_PROPAGATING_OPERATORS = new Set(['||', 'OR', 'AND']);
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -103,7 +116,15 @@ export function isInnerJoinType(type: JoinType): boolean {
 export function joinHasOnCondition(join: JoinEdge): boolean {
   if (join.conditionRoot) return true;
   const condition = join.condition.trim();
-  return condition.length > 0 && condition !== '(no condition)';
+  return condition.length > 0 && condition !== NO_JOIN_CONDITION;
+}
+
+/**
+ * すべての行の組み合わせ（直積）を作る結合か。ON / USING の無い CROSS JOIN と、
+ * カンマで並べただけのテーブル（WHERE に結合条件が無いもの。解析では CROSS JOIN として持つ）
+ */
+export function isCartesianJoin(join: JoinEdge): boolean {
+  return (join.type === 'CROSS JOIN' || isInnerJoinType(join.type)) && !joinHasOnCondition(join);
 }
 
 /**
@@ -155,72 +176,42 @@ function innerJoinReasonLabel(join: JoinEdge, tables: TableRef[]): string {
   return `${typeLabel} ${name}`;
 }
 
-function isNullPreservingCondition(node: ConditionNode): boolean {
-  if (node.type !== 'is_null') return false;
-  const upper = node.label.toUpperCase();
-  return upper.includes(' IS NULL') && !upper.includes(' IS NOT NULL');
-}
+/**
+ * 引数が NULL なら NULL を返す関数。ここに無い関数は、NULL を受け取っても NULL 以外を返しうるものとして扱う
+ * （NVL・NVL2・COALESCE・DECODE・NULLIF・LNNVL は別の値に置き換え、REPLACE と CONCAT は NULL の引数を
+ * 空文字列として扱い、利用者が作ったファンクションは何を返すか分からない）。
+ *
+ * 根拠（Oracle Database 23 SQL Language Reference）:
+ * - TRIM・LENGTH・TO_NUMBER・TRANSLATE は、各関数のページに「引数が null なら null を返す」と書かれている
+ * - ほかのスカラー関数は、各ページに記述が無い。「About SQL Functions」の
+ *   「Most scalar functions return null when given a null argument」と、一般に知られた動作に基づく推定
+ * - 集約関数は「Aggregate Functions」の、値がすべて null なら null を返す、という記述に基づく
+ *   （COUNT など NULL を返さない集約は isGroupLevelNullRejecting で除く）
+ * NOT は関数ではないが、同じく NULL をそのまま伝える
+ */
+const NULL_PROPAGATING_FUNCTIONS = new Set([
+  'upper', 'lower', 'initcap', 'trim', 'ltrim', 'rtrim', 'substr', 'instr', 'length', 'lpad', 'rpad', 'translate',
+  'abs', 'ceil', 'floor', 'round', 'trunc', 'mod', 'sign', 'sqrt', 'power',
+  'to_char', 'to_number', 'to_date', 'to_timestamp', 'add_months', 'months_between', 'last_day',
+  'cast', 'greatest', 'least',
+  'not',
+  'sum', 'avg', 'min', 'max', 'stddev', 'stddev_pop', 'stddev_samp', 'variance', 'var_pop', 'var_samp', 'median',
+]);
 
-/** IFNULL / COALESCE / NVL の引数範囲（開き括弧の直後〜閉じ括弧直前） */
-function findNullCoalescingArgSpans(rawExpr: string): Array<{ start: number; end: number }> {
+/** 関数の呼び出し（名前と開き括弧）。名前には日本語の文字セットの文字（U+0080〜U+FFFF）も含める */
+const FUNCTION_CALL_RE = /(?<![\w$#\u0080-￿])([\w$#\u0080-￿]+)\s*\(/gu;
+
+/** NULL を伝えると確かめていない関数の、引数の範囲（開き括弧の直後〜閉じ括弧の直前） */
+function findNonPropagatingCallArgSpans(rawExpr: string): Array<{ start: number; end: number }> {
   const expr = maskExprLiterals(rawExpr);
   const spans: Array<{ start: number; end: number }> = [];
-  const re = /\b(?:ifnull|coalesce|nvl)\s*\(/gi;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(expr)) !== null) {
+  for (const match of expr.matchAll(FUNCTION_CALL_RE)) {
+    // `pkg.upper(x)` は、そのパッケージやスキーマのファンクション。名前が組み込みの関数と同じでも別の関数になる
+    const qualified = expr[match.index - 1] === '.';
+    if (!qualified && NULL_PROPAGATING_FUNCTIONS.has(match[1]!.toLowerCase())) continue;
     const openParen = match.index + match[0].length - 1;
-    let depth = 1;
-    let i = openParen + 1;
-    let inSingle = false;
-    let inDouble = false;
-    let inBacktick = false;
-    while (i < expr.length && depth > 0) {
-      const ch = expr[i]!;
-      if (inSingle) {
-        if (ch === "'" && expr[i + 1] === "'") {
-          i += 2;
-          continue;
-        }
-        if (ch === "'") inSingle = false;
-        i++;
-        continue;
-      }
-      if (inDouble) {
-        if (ch === '"' && expr[i + 1] === '"') {
-          i += 2;
-          continue;
-        }
-        if (ch === '"') inDouble = false;
-        i++;
-        continue;
-      }
-      if (inBacktick) {
-        if (ch === '`') inBacktick = false;
-        i++;
-        continue;
-      }
-      if (ch === "'") {
-        inSingle = true;
-        i++;
-        continue;
-      }
-      if (ch === '"') {
-        inDouble = true;
-        i++;
-        continue;
-      }
-      if (ch === '`') {
-        inBacktick = true;
-        i++;
-        continue;
-      }
-      if (ch === '(') depth++;
-      else if (ch === ')') depth--;
-      i++;
-    }
-    if (depth === 0) {
-      spans.push({ start: openParen + 1, end: i - 1 });
-    }
+    const callEnd = readBalancedParenEnd(expr, openParen);
+    spans.push({ start: openParen + 1, end: callEnd === null ? expr.length : callEnd - 1 });
   }
   return spans;
 }
@@ -239,19 +230,32 @@ function tableRefStartPositions(rawExpr: string, identifiers: string[]): number[
 }
 
 /**
- * nullable 側への参照がすべて IFNULL / COALESCE / NVL の引数内にあるか。
- * 例: IFNULL(o.total, 0) = 0 は未結合行（NULL→0）が残りうるため実質 INNER にしない。
+ * nullable 側への参照がすべて、NULL を伝えると確かめていない関数の引数の中にあるか。
+ * 例: `NVL(o.total, 0) = 0` や `DECODE(o.x, NULL, 1, 0) = 1` は、未結合行（列が NULL）でも真になりうるので実質 INNER にしない。
+ * 引数の外に参照が 1 つでもあれば（`f(a.x) = o.y`）、その列が NULL の行では式全体も NULL になる
  */
-function expressionOnlyReferencesTableViaNullCoalescing(
+function referencesTableOnlyInsideNonPropagatingCalls(
   expr: string,
   identifiers: string[],
 ): boolean {
   if (!expressionReferencesTable(expr, identifiers)) return false;
-  const spans = findNullCoalescingArgSpans(expr);
+  const spans = findNonPropagatingCallArgSpans(expr);
   if (spans.length === 0) return false;
   const refs = tableRefStartPositions(expr, identifiers);
   if (refs.length === 0) return false;
   return refs.every((pos) => spans.some((span) => pos >= span.start && pos < span.end));
+}
+
+/**
+ * 式がこのテーブルの列を読み、その列が NULL なら式全体も NULL になるか。
+ * 式の中身までは解析せず、NULL を別の値に変えうる構文が 1 つでもあれば false にする。
+ */
+function expressionPropagatesNull(expr: string | undefined, identifiers: string[]): boolean {
+  if (!expr || !expressionReferencesTable(expr, identifiers)) return false;
+  if (NULL_SWALLOWING_RE.test(maskExprLiterals(expr))) return false;
+  // 参照が、NULL を伝えると確かめていない関数の引数の中にしか無いときは、未結合行を残しうる
+  if (referencesTableOnlyInsideNonPropagatingCalls(expr, identifiers)) return false;
+  return true;
 }
 
 /**
@@ -315,61 +319,153 @@ function isOuterJoinMarkedForTable(node: ConditionNode, identifiers: string[]): 
   return !!marked && expressionReferencesTable(marked, identifiers);
 }
 
+/**
+ * この葉の条件が、nullable 側の列がすべて NULL の行（未結合行）では決して真にならないか。
+ * negated は NOT の内側にあるとき true。値が NULL になる条件は NOT を付けても NULL のままだが、
+ * `IS NOT NULL` や `IN (サブクエリ)` は NOT を付けると未結合行で真になる。
+ */
 function isNullRejectingLeaf(
   node: ConditionNode,
   identifiers: string[],
+  negated: boolean,
   joinDerivedIds: Set<string>,
 ): boolean {
   if (joinDerivedIds.has(node.id)) return false;
   if (isOuterJoinMarkedForTable(node, identifiers)) return false;
-  if (isNullPreservingCondition(node)) return false;
-  if (!NULL_REJECTING_CONDITION_TYPES.has(node.type)) return false;
+  const operator = (node.operator ?? '').replace(/\s+/g, ' ').trim().toUpperCase();
 
-  const exprs = [node.left, node.label].filter((e): e is string => !!e);
-  if (!exprs.some((e) => expressionReferencesTable(e, identifiers))) return false;
-
-  // 参照が NULL 置換関数の引数にしか無いときは未結合行を残しうる（過検出回避）
-  const coalescedOnly = exprs.every(
-    (e) =>
-      !expressionReferencesTable(e, identifiers) ||
-      expressionOnlyReferencesTableViaNullCoalescing(e, identifiers),
-  );
-  if (coalescedOnly) return false;
-
-  return true;
+  switch (node.type) {
+    case 'comparison':
+    case 'like': {
+      if (NON_NULL_PROPAGATING_OPERATORS.has(operator)) return false;
+      if (operator === 'IS' || operator === 'IS NOT') {
+        return isTestRejectsNull(node, identifiers, operator === 'IS NOT' ? !negated : negated);
+      }
+      const quantifier = /^(ALL|ANY|SOME)\s*\(/i.exec((node.right ?? '').trim())?.[1]?.toUpperCase();
+      if (quantifier) {
+        // サブクエリが 0 行のとき、`x <> ALL (…)` は x が NULL でも真、`x = ANY (…)` は偽になる
+        // （Oracle Database 23 SQL Language Reference「Comparison Conditions」）。1 行以上なら x が NULL のときはどちらも NULL。
+        // 真にならないのは ALL を否定したときと、ANY を否定しないとき
+        if ((quantifier === 'ALL') !== negated) return false;
+        return expressionPropagatesNull(node.left, identifiers);
+      }
+      return (
+        expressionPropagatesNull(node.left, identifiers) ||
+        expressionPropagatesNull(node.right, identifiers)
+      );
+    }
+    case 'between':
+      // 境界側だけが NULL のとき、NOT BETWEEN は真になりうる（`5 NOT BETWEEN NULL AND 1`）。左辺だけを見る
+      return expressionPropagatesNull(node.left, identifiers);
+    case 'in':
+      // `NULL NOT IN (空のサブクエリ)` は真。サブクエリ相手は否定の無い IN だけを根拠にする
+      if (node.nestedQuery && (negated || operator !== 'IN')) return false;
+      // リスト側にだけ参照があるとき（`a.x IN (o.y, 1)`）は未結合行でも真になりうる。左辺だけを見る
+      return expressionPropagatesNull(node.left, identifiers);
+    case 'subquery':
+      if (NON_NULL_PROPAGATING_OPERATORS.has(operator)) return false;
+      return expressionPropagatesNull(node.left, identifiers);
+    case 'function':
+    case 'raw':
+      return expressionPropagatesNull(node.label, identifiers);
+    case 'is_null':
+      return isTestRejectsNull(node, identifiers, negated);
+    default:
+      // exists は根拠にしない
+      return false;
+  }
 }
 
-function collectConditionReasons(
+/**
+ * `x IS NULL` / `x IS NOT NULL` などで、x が NULL の行では決して真にならないか。
+ * inverted は IS NOT と外側の NOT を合わせて、否定が奇数回掛かっているとき true。
+ * x が NULL のとき `IS NULL` は真、`IS TRUE` / `IS FALSE` は偽になる（否定するとそれぞれ逆）
+ */
+function isTestRejectsNull(node: ConditionNode, identifiers: string[], inverted: boolean): boolean {
+  const target = (node.right ?? '').trim().toUpperCase();
+  let rejects: boolean;
+  if (target === 'NULL' || target === 'UNKNOWN') rejects = inverted;
+  else if (target === 'TRUE' || target === 'FALSE') rejects = !inverted;
+  else return false;
+  return rejects && expressionPropagatesNull(node.left, identifiers);
+}
+
+interface NullRejectingLeaf {
+  node: ConditionNode;
+  /** NOT の内側にある葉。理由に出すときは NOT を付けて、元の条件と同じ意味の文にする */
+  negated: boolean;
+}
+
+/**
+ * 条件木から「未結合行では決して真にならない」葉を集める。
+ * OR の枝は、もう一方の枝が真なら行が残るので根拠にしない。
+ * NOT の内側では AND と OR が入れ替わる（`NOT (A AND B)` は `NOT A OR NOT B`）。
+ */
+function collectNullRejectingLeaves(
   node: ConditionNode | undefined,
-  kind: 'where' | 'having',
   identifiers: string[],
-  underOr: boolean,
   joinDerivedIds: Set<string>,
-): EffectiveInnerReason[] {
+  underOr = false,
+  negated = false,
+): NullRejectingLeaf[] {
   if (!node) return [];
-
-  if (node.type === 'or') {
-    return (node.children ?? []).flatMap((child) =>
-      collectConditionReasons(child, kind, identifiers, true, joinDerivedIds),
-    );
-  }
-
-  if (node.type === 'and') {
-    return (node.children ?? []).flatMap((child) =>
-      collectConditionReasons(child, kind, identifiers, underOr, joinDerivedIds),
-    );
-  }
 
   if (node.type === 'not') {
     return (node.children ?? []).flatMap((child) =>
-      collectConditionReasons(child, kind, identifiers, underOr, joinDerivedIds),
+      collectNullRejectingLeaves(child, identifiers, joinDerivedIds, underOr, !negated),
     );
   }
 
-  if (underOr || !isNullRejectingLeaf(node, identifiers, joinDerivedIds)) return [];
+  if (node.type === 'and' || node.type === 'or') {
+    const actsAsOr = (node.type === 'or') !== negated;
+    return (node.children ?? []).flatMap((child) =>
+      collectNullRejectingLeaves(child, identifiers, joinDerivedIds, underOr || actsAsOr, negated),
+    );
+  }
 
+  if (underOr || !isNullRejectingLeaf(node, identifiers, negated, joinDerivedIds)) return [];
+  return [{ node, negated }];
+}
+
+function leafReasonText(leaf: NullRejectingLeaf): string {
+  return leaf.negated ? `NOT (${leaf.node.label})` : leaf.node.label;
+}
+
+/** `GROUP BY ROLLUP (…)` / `CUBE (…)`。小計・総計の行は、未結合の行と結合できた行を同じグループにまとめる */
+function hasSubtotalGrouping(query: ParsedQuery): boolean {
+  return query.groupBy.some((fragment) => /^\s*(?:ROLLUP|CUBE|GROUPING\s+SETS)\s*\(/i.test(fragment.text));
+}
+
+/**
+ * HAVING の葉が、未結合の行のグループを除く根拠になるか。
+ *
+ * 集約はグループの行をまとめた値なので、次のときは根拠にしない。
+ * - NULL だけのグループでも NULL を返さない集約を含む（`HAVING COUNT(o.id) = 0` は未結合の行だけを残す）
+ * - GROUP BY が無い、または ROLLUP / CUBE を使う。未結合の行と結合できた行が同じグループ（小計の行を含む）に入る
+ *
+ * `GROUP BY u.id HAVING SUM(o.x) > 0` は、u.id が一意なら未結合の u の行だけのグループができ、
+ * SUM が NULL になり、HAVING で除かれる。GROUP BY の列が一意かは SQL だけでは分からないので、ここは一意とみなしている
+ */
+function isGroupLevelNullRejecting(leaf: NullRejectingLeaf, query: ParsedQuery): boolean {
+  const text = maskExprLiterals(leaf.node.label);
+  if (!AGGREGATE_CALL_RE.test(text)) return true;
+  if (NON_NULL_AGGREGATE_CALL_RE.test(text)) return false;
+  return query.groupBy.length > 0 && !hasSubtotalGrouping(query);
+}
+
+function collectConditionReasons(
+  query: ParsedQuery,
+  kind: 'where' | 'having',
+  identifiers: string[],
+  joinDerivedIds: Set<string>,
+): EffectiveInnerReason[] {
   const prefix = kind === 'where' ? 'WHERE' : 'HAVING';
-  return [{ kind, label: `${prefix}: ${node.label}` }];
+  const leaves = collectNullRejectingLeaves(kind === 'where' ? query.where : query.having, identifiers, joinDerivedIds);
+  const usable = kind === 'having' ? leaves.filter((leaf) => isGroupLevelNullRejecting(leaf, query)) : leaves;
+  return usable.map((leaf) => ({
+    kind,
+    label: `${prefix}: ${leafReasonText(leaf)}`,
+  }));
 }
 
 function findSubsequentInnerJoinReasons(
@@ -377,13 +473,21 @@ function findSubsequentInnerJoinReasons(
   tables: TableRef[],
   joinIndex: number,
   identifiers: string[],
+  joinDerivedIds: Set<string>,
 ): EffectiveInnerReason[] {
   const reasons: EffectiveInnerReason[] = [];
 
   for (let i = joinIndex + 1; i < joins.length; i++) {
     const join = joins[i]!;
     if (!isInnerLikeJoin(join)) continue;
-    if (!expressionReferencesTable(resolveJoinConditionExpression(join), identifiers)) continue;
+    // ON に nullable 側の列が出てくるだけでは足りない。`ON p.id = o.pid OR p.aid = a.id` や
+    // `ON p.id = NVL(o.pid, a.pid)` は未結合行でも成り立つので、WHERE と同じ基準で葉を調べる。
+    // WHERE から作った結合（カンマ結合と旧式 (+)）の条件も、結合条件そのものとして調べる
+    const root = join.layoutConditionRoot ?? join.conditionRoot;
+    const rejects = root
+      ? collectNullRejectingLeaves(root, identifiers, join.fromWhereClause ? new Set() : joinDerivedIds).length > 0
+      : expressionPropagatesNull(resolveJoinConditionExpression(join), identifiers);
+    if (!rejects) continue;
     reasons.push({
       kind: 'inner_join',
       label: innerJoinReasonLabel(join, tables),
@@ -414,9 +518,9 @@ function reasonsForNullableTable(
   if (identifiers.length === 0) return [];
 
   return dedupeReasons([
-    ...findSubsequentInnerJoinReasons(query.joins, query.tables, joinIndex, identifiers),
-    ...collectConditionReasons(query.where, 'where', identifiers, false, joinDerivedIds),
-    ...collectConditionReasons(query.having, 'having', identifiers, false, joinDerivedIds),
+    ...findSubsequentInnerJoinReasons(query.joins, query.tables, joinIndex, identifiers, joinDerivedIds),
+    ...collectConditionReasons(query, 'where', identifiers, joinDerivedIds),
+    ...collectConditionReasons(query, 'having', identifiers, joinDerivedIds),
   ]);
 }
 
@@ -478,7 +582,7 @@ export function formatEffectiveInnerJoinScopeLine(
 ): string {
   const nullableLabel = tableDisplayLabel(nullableTable);
   const cause = formatEffectiveInnerCausePhrase(reasons);
-  return `${preservedLabel} と ${nullableLabel}は実質 INNER JOIN — 結合条件「${join.condition}」を満たす組み合わせのみ残る。SQL上は ${join.type}（${nullableLabel}が無い行も${preservedLabel}は残る）だが、${cause}${nullableLabel}が無い行も除外される`;
+  return `${preservedLabel} と ${nullableLabel}は実質 INNER JOIN — 結合条件「${joinConditionDisplayText(join.condition)}」を満たす組み合わせのみ残る。SQL上は ${join.type}（${nullableLabel}が無い行も${preservedLabel}は残る）だが、${cause}${nullableLabel}が無い行も除外される`;
 }
 
 export function effectiveInnerAnalysisByJoinId(

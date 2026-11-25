@@ -1,5 +1,7 @@
 import {
+  createTrailingTriviaTrimmer,
   isLineCommentStart,
+  isWordChar,
   maskNonCode,
   readBalancedParenEnd,
   readBlockCommentEnd,
@@ -74,6 +76,8 @@ export interface PreprocessResult {
   nullsOrders: NullsOrderInfo[];
   /** preprocessed[i] の文字が元 SQL のどの位置か */
   processedToOriginal: number[];
+  /** 前処理で置き換えた関数名（大文字の仮の名前 → 元の名前）。表示では元の名前に戻す */
+  renamedFunctions: Map<string, string>;
 }
 
 interface ProcessState {
@@ -256,6 +260,11 @@ function rewriteAlternativeQuotes(state: ProcessState): void {
     const start = readQQuoteStart(sql, i);
     if (start) {
       const end = readQQuoteEnd(sql, i);
+      // 閉じていない代替引用符は書き換えない。書き換えると末尾の 2 文字を閉じ記号とみなして別の文字列にしてしまい、
+      // 構文エラーにならない。そのまま渡せば、パーサーのエラーから「閉じていません」と示せる
+      const closed =
+        end != null && end >= start.quoteCharIndex + 4 && sql.slice(end - 2, end) === `${start.terminator}'`;
+      if (end != null && !closed) break;
       if (end != null) {
         const body = sql.slice(start.quoteCharIndex + 2, Math.max(start.quoteCharIndex + 2, end - 2));
         replacements.push({ start: i, end, inserted: `'${body.replace(/'/g, "''")}'` });
@@ -954,15 +963,22 @@ function escapeBackslashesInStringLiterals(state: ProcessState): void {
 }
 
 // ---------------------------------------------------------------------------
-// `#` / `$` を含む識別子
+// `#` / `$` / ASCII 以外の文字を含む識別子
 // ---------------------------------------------------------------------------
 
-/** 引用していない Oracle 識別子。`#` と `$` は 2 文字目以降に使える */
-const ORACLE_IDENTIFIER_RE = /[A-Za-z][A-Za-z0-9_$#]*/g;
+/**
+ * 引用していない Oracle 識別子。先頭はデータベースの文字セットの英字、2 文字目以降は英数字と `_` `$` `#`
+ * （Oracle Database 23 SQL Language Reference「Database Object Names and Qualifiers」）。
+ * 日本語の文字セットなら、カタカナ・ひらがな・漢字も英数字に入る。
+ * 文字・数字・結合文字だけの並びに限る。全角の空白や記号は含めず、パーサーのエラーで位置を示す
+ */
+const ORACLE_IDENTIFIER_RE = /\p{L}[\p{L}\p{N}\p{M}_$#]*/gu;
 
 /**
  * Oracle は `EMP#` や `USER$` のような識別子を許すが、パーサ側は `#` を行コメント開始として
- * 扱って**エラーも出さずに行の残りを捨てる**。引用してパーサへ渡し、名前をそのまま残す
+ * 扱って**エラーも出さずに行の残りを捨てる**。引用してパーサへ渡し、名前をそのまま残す。
+ * ASCII 以外の文字を含む識別子（`ユーザー`、`受注2` など）も引用する。パーサーは漢字と一部のラテン文字しか
+ * 識別子に認めず、カタカナやひらがなのテーブル名で構文エラーになる。引用しても名前は変わらない
  */
 function quoteIdentifiersWithSpecialChars(state: ProcessState): void {
   const masked = maskNonCode(state.sql);
@@ -971,12 +987,137 @@ function quoteIdentifiersWithSpecialChars(state: ProcessState): void {
   let match: RegExpExecArray | null;
   while ((match = ORACLE_IDENTIFIER_RE.exec(masked)) !== null) {
     const word = match[0];
-    if (!word.includes('#') && !word.includes('$')) continue;
+    // 語の途中（`1abc` の abc など）から始まる並びは、識別子の先頭ではない
+    if (isWordChar(masked[match.index - 1])) continue;
+    const hasSpecial = word.includes('#') || word.includes('$');
+    const hasNonAscii = /[^\x00-\x7f]/.test(word);
+    if (!hasSpecial && !hasNonAscii) continue;
+    // U+10000 以降（サロゲートペア）はパーサーが読めないので、パーサーのエラーに任せる
+    if (/[\ud800-\udfff]/.test(word)) continue;
     targets.push({ start: match.index, end: match.index + word.length });
   }
 
   for (const { start, end } of targets.reverse()) {
     spliceProcessed(state, start, end, `\`${state.sql.slice(start, end)}\``);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 集約関数の DISTINCT と、パーサーが読めない集約関数の名前
+// ---------------------------------------------------------------------------
+
+/**
+ * `SUM(DISTINCT a)` の DISTINCT。Oracle は集約関数の引数の前に DISTINCT を書ける
+ * （Oracle Database 23 SQL Language Reference「Aggregate Functions」）が、パーサーは COUNT でしか読めず、
+ * 構文エラーになる。`DISTINCT(a)` の形なら読めるので、DISTINCT の後ろの引数を括弧で囲む（表示は parser.ts で元の形に戻す）
+ */
+const AGGREGATE_DISTINCT_RE =
+  /(?<![\w$#.`\u0080-￿])(?:SUM|AVG|MIN|MAX|STDDEV|STDDEV_POP|STDDEV_SAMP|VARIANCE|VAR_POP|VAR_SAMP|MEDIAN)\s*\(\s*DISTINCT\b/giu;
+
+function parenthesizeAggregateDistinct(state: ProcessState): void {
+  const masked = maskNonCode(state.sql);
+  const inserts: Array<{ at: number; text: string }> = [];
+  for (const match of masked.matchAll(AGGREGATE_DISTINCT_RE)) {
+    const openParen = masked.indexOf('(', match.index);
+    const closeParenEnd = readBalancedParenEnd(masked, openParen);
+    if (closeParenEnd == null) continue;
+    const argStart = skipMaskedWhitespace(masked, match.index + match[0].length);
+    let argEnd = closeParenEnd - 1;
+    while (argEnd > argStart && /\s/.test(masked[argEnd - 1]!)) argEnd -= 1;
+    if (argEnd <= argStart) continue;
+    inserts.push({ at: argStart, text: '(' }, { at: argEnd, text: ')' });
+  }
+  // 後ろから挿入して、前にある挿入位置をずらさない
+  inserts.sort((a, b) => b.at - a.at);
+  for (const { at, text } of inserts) spliceProcessed(state, at, at, text);
+}
+
+/**
+ * 集約関数の VARIANCE。パーサーは集約関数の名前として予約しているのに読む規則を持たず、構文エラーになる。
+ * SQL に現れない仮の名前に置き換えて普通の関数として読ませ、表示では parser.ts が元の名前に戻す
+ */
+const RESERVED_AGGREGATE_NAME_RE = /(?<![\w$#.`\u0080-￿])VARIANCE(?=\s*\()/giu;
+
+function renameReservedAggregates(state: ProcessState): Map<string, string> {
+  const renamed = new Map<string, string>();
+  const masked = maskNonCode(state.sql);
+  const matches = [...masked.matchAll(RESERVED_AGGREGATE_NAME_RE)];
+  if (matches.length === 0) return renamed;
+  const upperSql = state.sql.toUpperCase();
+  const placeholderFor = (name: string): string => {
+    const upper = name.toUpperCase();
+    for (const [placeholder, original] of renamed) if (original === upper) return placeholder;
+    let placeholder = `QV_${upper}_`;
+    while (upperSql.includes(placeholder)) placeholder += '_';
+    renamed.set(placeholder, upper);
+    return placeholder;
+  };
+  const replacements = matches.map((match) => ({
+    start: match.index,
+    end: match.index + match[0].length,
+    text: placeholderFor(match[0]),
+  }));
+  for (const { start, end, text } of replacements.reverse()) spliceProcessed(state, start, end, text);
+  return renamed;
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE の SET a = DEFAULT
+// ---------------------------------------------------------------------------
+
+/** SET 句の終わりを示す語 */
+const SET_CLAUSE_END_WORDS = new Set(['WHERE', 'RETURN', 'RETURNING', 'LOG']);
+
+/**
+ * UPDATE の `SET a = DEFAULT`。Oracle は列を既定値に戻す書き方として DEFAULT を書ける
+ * （Oracle Database 23 SQL Language Reference「UPDATE」の update_set_clause）が、パーサーは
+ * `DEFAULT(a)` の関数の形しか読めない。SET の値がちょうど DEFAULT の 1 語のときだけ、
+ * 引用識別子にして列の名前として読ませる（表示は DEFAULT のまま）
+ */
+function quoteUpdateSetDefault(state: ProcessState): void {
+  const masked = maskNonCode(state.sql);
+  const firstUpdate = findWholeWordStarts(masked, 'UPDATE')[0];
+  if (firstUpdate === undefined) return;
+  const starts: number[] = [];
+  for (const setStart of findWholeWordStarts(masked, 'SET')) {
+    if (setStart < firstUpdate) continue;
+    let depth = 0;
+    let i = setStart + 'SET'.length;
+    /** いま読んでいる `列 = 値` の始まり（SET の直後か、深さ 0 の `,` の直後） */
+    let itemStart = i;
+    while (i < masked.length) {
+      const ch = masked[i]!;
+      if (ch === '(') depth += 1;
+      else if (ch === ')') depth -= 1;
+      else if (ch === ',' && depth === 0) itemStart = i + 1;
+      if (depth < 0) break;
+      const atWordStart = /[A-Za-z_]/.test(ch) && !isWordChar(masked[i - 1]) && masked[i - 1] !== '.';
+      const token = atWordStart ? readWord(masked, i) : null;
+      if (!token) {
+        i += 1;
+        continue;
+      }
+      const word = token.word.toUpperCase();
+      if (depth === 0 && SET_CLAUSE_END_WORDS.has(word)) break;
+      if (depth === 0 && word === 'DEFAULT') {
+        const next = skipMaskedWhitespace(masked, token.end);
+        const after = masked[next];
+        const nextWord = readWord(masked, next)?.word.toUpperCase();
+        const endsValue =
+          after === undefined ||
+          after === ',' ||
+          after === ';' ||
+          (nextWord !== undefined && SET_CLAUSE_END_WORDS.has(nextWord));
+        // 値の位置（`列 =` の直後）の DEFAULT だけを見る。`b != DEFAULT` のような比較の右の DEFAULT は書き換えない
+        const isAssignedValue = /^[^=<>!:^]*=$/.test(masked.slice(itemStart, i).trim());
+        if (isAssignedValue && endsValue) starts.push(i);
+      }
+      i = token.end;
+    }
+  }
+  // 同じ長さの引用識別子は作れないので、長さの変わる書き換えにする
+  for (const start of starts.sort((a, b) => b - a)) {
+    spliceProcessed(state, start, start + 'DEFAULT'.length, '"DEFAULT"');
   }
 }
 
@@ -1011,6 +1152,8 @@ function rewriteQuotedIdentifiers(state: ProcessState): void {
     }
     if (sql[i] === '"') {
       const end = readQuotedIdentifierEnd(sql, i);
+      // 閉じていない引用識別子は書き換えない。最後の 1 文字を閉じ記号に置き換えると、構文エラーにならずに別の名前として読まれる
+      if (end - i < 2 || sql[end - 1] !== '"') return;
       const inner = sql.slice(i + 1, Math.max(i + 1, end - 1));
       // 長さを保つため `""` は `` `` `` へ 1:1 で置き換える
       out += `\`${inner.replace(/""/g, '``')}\``;
@@ -1056,6 +1199,7 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
   normalizeSelectModifiers(state);
   expandMultiColumnUpdateSet(state);
   insertOmittedDeleteFrom(state);
+  quoteUpdateSetDefault(state);
 
   applyRegexReplacementsInCode(state, [
     {
@@ -1069,6 +1213,8 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
   ]);
 
   escapeBackslashesInStringLiterals(state);
+  parenthesizeAggregateDistinct(state);
+  const renamedFunctions = renameReservedAggregates(state);
   quoteIdentifiersWithSpecialChars(state);
 
   // 位置が動かない書き換えなので、記録済みのオフセットはそのまま使える
@@ -1083,6 +1229,7 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
     hints,
     nullsOrders,
     processedToOriginal: state.processedToOriginal,
+    renamedFunctions,
   };
 }
 
@@ -1125,10 +1272,6 @@ function remapConditionNode(
   };
 }
 
-function isIdentChar(ch: string | undefined): boolean {
-  return ch !== undefined && /[\w$]/.test(ch);
-}
-
 function skipSqlTrivia(sql: string, pos: number): number {
   let i = pos;
   while (i < sql.length) {
@@ -1157,7 +1300,7 @@ function aliasEquals(a: string, b: string): boolean {
 
 function isAsKeywordAt(sql: string, pos: number): number | null {
   if (sql.slice(pos, pos + 2).toUpperCase() !== 'AS') return null;
-  if (isIdentChar(sql[pos + 2])) return null;
+  if (isWordChar(sql[pos + 2])) return null;
   return pos + 2;
 }
 
@@ -1172,7 +1315,7 @@ function matchAliasTokenAt(sql: string, pos: number, alias: string): number | nu
   const end = pos + alias.length;
   if (end > sql.length) return null;
   if (!aliasEquals(sql.slice(pos, end), alias)) return null;
-  if (isIdentChar(sql[end])) return null;
+  if (isWordChar(sql[end])) return null;
   return end;
 }
 
@@ -1238,5 +1381,70 @@ export function remapParsedQuerySpans(
       sourceSpan: remapSourceSpan(map, branch.sourceSpan),
       query: remapParsedQuerySpans(map, branch.query, originalSql),
     })),
+    embeddedSubqueries: query.embeddedSubqueries?.map((sub) => remapParsedQuerySpans(map, sub, originalSql)),
   };
+}
+
+/**
+ * 解析結果の中のすべての範囲（sourceSpan / limitSpan など、名前が Span で終わるもの）を delta だけ後ろへずらす。
+ * 解析は前後の空白を取り除いた SQL で行うので、呼び出し元が渡した SQL の座標に戻すのに使う。
+ * 解析結果はこの解析で作ったばかりのオブジェクトなので、範囲のオブジェクトをその場で差し替える
+ */
+export function shiftParsedQuerySpans(query: ParsedQuery, delta: number): ParsedQuery {
+  if (delta === 0) return query;
+  visitSpans(query, (span) => ({ start: span.start + delta, end: span.end + delta }));
+  return query;
+}
+
+/**
+ * 解析結果の中のすべての範囲から、終端の後ろに付いた空白とコメントを除く。
+ * sql は範囲の座標の基準になっている SQL（入力の SQL）
+ */
+export function trimParsedQuerySpanEnds(query: ParsedQuery, sql: string): ParsedQuery {
+  const trimEnd = createTrailingTriviaTrimmer(sql);
+  visitSpans(query, (span) => {
+    const end = trimEnd(span.start, span.end);
+    return end === span.end ? span : { start: span.start, end };
+  });
+  return query;
+}
+
+/**
+ * 名前が Span で終わるフィールドの範囲を、update の戻り値で差し替える。
+ * 同じ範囲のオブジェクトを複数の要素が持っていても、update は 1 回だけ呼ぶ（2 回ずらさない）
+ */
+function visitSpans(root: unknown, update: (span: SourceSpan) => SourceSpan): void {
+  const seen = new Set<object>();
+  const replaced = new Map<SourceSpan, SourceSpan>();
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== 'object' || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    for (const [key, child] of Object.entries(record)) {
+      if (key.endsWith('Span') && isSpan(child)) {
+        let next = replaced.get(child);
+        if (!next) {
+          next = update(child);
+          replaced.set(child, next);
+        }
+        if (next !== child) record[key] = next;
+      } else {
+        visit(child);
+      }
+    }
+  };
+  visit(root);
+}
+
+function isSpan(value: unknown): value is SourceSpan {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    typeof (value as SourceSpan).start === 'number' &&
+    typeof (value as SourceSpan).end === 'number'
+  );
 }

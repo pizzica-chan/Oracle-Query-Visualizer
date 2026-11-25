@@ -6,11 +6,15 @@
 // （オフライン配布の JS を大幅に軽くする）
 import { Parser } from 'node-sql-parser/build/mysql';
 import { normalizeConditionTree } from './condition-tree-normalize';
-import { formatJoinConditionLabel } from './join-condition';
+import { NO_JOIN_CONDITION, formatJoinConditionLabel } from './join-condition';
+import { fixLogicalOperatorPrecedence } from './logical-precedence';
+import { findUnclosedLiteral, isWordChar } from './sql-lex';
 import {
   maskNonCode,
   preprocessSqlForParser,
   remapParsedQuerySpans,
+  shiftParsedQuerySpans,
+  trimParsedQuerySpanEnds,
   type HierarchicalClauseInfo,
   type NullsOrderInfo,
   type OptimizerHintInfo,
@@ -51,6 +55,13 @@ let hierarchicalClauses: HierarchicalClauseInfo[] = [];
 let rowLimits: RowLimitInfo[] = [];
 let optimizerHints: OptimizerHintInfo[] = [];
 let nullsOrders: NullsOrderInfo[] = [];
+/** 前処理で置き換えた関数名（大文字の仮の名前 → 元の名前） */
+let renamedFunctions = new Map<string, string>();
+/**
+ * exprToString が要約したサブクエリの AST。いま組み立てているクエリの分だけを持つ
+ * （collectEmbeddedSubqueries がクエリごとに差し替える）
+ */
+let embeddedSubqueryAsts: any[] = [];
 
 function nextId(prefix: string): string {
   nodeCounter += 1;
@@ -66,6 +77,29 @@ function resetIds(): void {
   rowLimits = [];
   optimizerHints = [];
   nullsOrders = [];
+  renamedFunctions = new Map();
+  embeddedSubqueryAsts = [];
+}
+
+function noteEmbeddedSubquery(ast: any): void {
+  if (!embeddedSubqueryAsts.includes(ast)) embeddedSubqueryAsts.push(ast);
+}
+
+/**
+ * build の間に exprToString が要約したサブクエリを解析し、embeddedSubqueries として持たせる。
+ * 要約した文字列（`(SELECT 1列 FROM t)`）だけでは、中の別名がどのテーブルを指すかが分からない
+ */
+function collectEmbeddedSubqueries(build: () => ParsedQuery): ParsedQuery {
+  const outer = embeddedSubqueryAsts;
+  embeddedSubqueryAsts = [];
+  try {
+    const query = build();
+    const collected = embeddedSubqueryAsts;
+    if (collected.length === 0) return query;
+    return { ...query, embeddedSubqueries: collected.map((ast) => parseSelectQuery(ast, '')) };
+  } finally {
+    embeddedSubqueryAsts = outer;
+  }
 }
 
 function formatIdentifier(name: unknown): string {
@@ -88,7 +122,20 @@ function toArray<T>(value: T | T[] | null | undefined): T[] {
   return Array.isArray(value) ? value : [value];
 }
 
+/**
+ * 関数名を大文字で返す。前処理で仮の名前に置き換えた関数（VARIANCE）は、元の名前に戻す。
+ * `pkg.f(x)` や `schema.f(x)` の修飾は、パーサーが名前とは別の schema に入れる。落とすと、
+ * 別のパッケージの関数（pkg1.f と pkg2.f）が同じ関数に見える
+ */
 function resolveFunctionName(nameField: unknown): string {
+  const name = readFunctionName(nameField);
+  const restored = renamedFunctions.get(name) ?? name;
+  const schema =
+    nameField && typeof nameField === 'object' ? formatIdentifier((nameField as { schema?: unknown }).schema) : '';
+  return schema ? `${schema}.${restored}` : restored;
+}
+
+function readFunctionName(nameField: unknown): string {
   if (typeof nameField === 'string') return nameField.toUpperCase();
   if (!nameField || typeof nameField !== 'object') return '';
 
@@ -119,17 +166,17 @@ function extractFunctionArgs(node: any): any[] {
   return toArray(raw);
 }
 
-function unescapeSqlSingleQuotedValue(value: string): string {
-  return value.replace(/''/g, "'");
-}
-
+/**
+ * 文字列リテラルを引用符で囲んで書く。パーサーは引用符の中身を、`''` も含めて書いたとおりに value に入れる。
+ * ただしバックスラッシュは、前処理（escapeBackslashesInStringLiterals）が二重にしてから渡しているので、元の 1 つに戻す。
+ * 戻さないと、`'C:\temp'` が `'C:\\temp'`（別の値）に見える
+ */
 function formatSingleQuotedString(value: string): string {
-  const unescaped = unescapeSqlSingleQuotedValue(value);
-  return `'${unescaped.replace(/'/g, "''")}'`;
+  return `'${value.replace(/\\\\/g, '\\')}'`;
 }
 
 function formatDoubleQuotedString(value: string): string {
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return `"${value}"`;
 }
 
 function formatQuotedLiteral(node: any): string {
@@ -139,6 +186,26 @@ function formatQuotedLiteral(node: any): string {
   }
   if (node.type === 'double_quote_string') return formatDoubleQuotedString(String(node.value));
   return formatSingleQuotedString(String(node.value));
+}
+
+/**
+ * 接頭辞の付くリテラル（N'abc'、DATE '2024-01-01'、TIMESTAMP '2024-01-01 00:00:00'）。
+ * パーサーは引用符の中身だけを value に入れるので、接頭辞と引用符を戻さないと、
+ * DATE '2024-01-01' が 2024-01-01（引き算の式）に、N'abc' が列名の abc に見える
+ */
+function formatPrefixedLiteral(node: any): string | null {
+  const value = String(node.value ?? '');
+  switch (node.type) {
+    case 'natural_string':
+      return `N${formatSingleQuotedString(value)}`;
+    case 'date':
+    case 'time':
+    case 'timestamp':
+    case 'datetime':
+      return `${String(node.type).toUpperCase()} ${formatSingleQuotedString(value)}`;
+    default:
+      return null;
+  }
 }
 
 /** LIKE の ESCAPE 句。右辺に付くので、比較を組み立てるときも忘れず添える */
@@ -156,7 +223,8 @@ function formatFunctionArgs(args: any[]): string {
   let prevWasKeyword = false;
   args.forEach((arg: any, index: number) => {
     const isKeyword = arg?.type === 'origin';
-    const text = exprToString(arg);
+    // キーワード（LEADING・FROM など）は、ほかのキーワードと同じく大文字で書く。パーサーは書いたとおりに持つ
+    const text = isKeyword ? exprToString(arg).toUpperCase() : exprToString(arg);
     if (index > 0) out += isKeyword || prevWasKeyword ? ' ' : ', ';
     out += text;
     prevWasKeyword = isKeyword;
@@ -173,10 +241,25 @@ function formatCastTarget(target: any): string {
   return params.length > 0 ? `${dataType}(${params.join(',')})` : dataType;
 }
 
+/**
+ * ウィンドウ枠。`ROWS BETWEEN a AND b` は BETWEEN の二項式、
+ * `ROWS UNBOUNDED PRECEDING` は { type: 'rows', expr } の形で来る
+ */
+function formatWindowFrame(frame: any): string {
+  if (!frame) return '';
+  if (frame.type !== 'binary_expr' && typeof frame.type === 'string' && frame.expr) {
+    return `${frame.type} ${exprToString(frame.expr)}`;
+  }
+  return exprToString(frame);
+}
+
 /** 分析関数の OVER 句。落とすと同じ関数呼び出しに見えてしまう */
 function formatOverClause(over: any): string {
-  const spec = over?.as_window_specification?.window_specification;
-  if (!spec) return over?.as_window_specification?.name ? ` OVER ${over.as_window_specification.name}` : '';
+  const named = over?.as_window_specification;
+  // `OVER w`（WINDOW 句で定義した名前の参照）は文字列で来る
+  if (typeof named === 'string') return named ? ` OVER ${named}` : '';
+  const spec = named?.window_specification;
+  if (!spec) return named?.name ? ` OVER ${named.name}` : '';
 
   const parts: string[] = [];
   const partitionBy = toArray<any>(spec.partitionby)
@@ -189,11 +272,28 @@ function formatOverClause(over: any): string {
     .filter((text) => text.trim().length > 0);
   if (orderBy.length > 0) parts.push(`ORDER BY ${orderBy.join(', ')}`);
 
+  // 枠（ROWS BETWEEN 1 PRECEDING AND CURRENT ROW など）は集計する行の範囲を決める。落とすと別の集計に見える
+  const frame = formatWindowFrame(spec.window_frame_clause);
+  if (frame) parts.push(frame.toUpperCase());
+
   return ` OVER (${parts.join(' ')})`;
+}
+
+/** 式に付く COLLATE。表示から外すと、照合順序を変えた比較が普通の比較と同じ式に見える */
+function formatExprSuffix(node: any): string {
+  let out = '';
+  const collation = node?.collate?.collate?.name;
+  if (collation) out += ` COLLATE ${formatIdentifier(collation)}`;
+  if (typeof node?.suffix === 'string' && node.suffix) out += ` ${node.suffix}`;
+  return out;
 }
 
 function exprToString(node: any): string {
   if (!node) return '';
+  return `${exprToStringCore(node)}${formatExprSuffix(node)}`;
+}
+
+function exprToStringCore(node: any): string {
 
   // 元 SQL の括弧を落とすと (a + b) * 2 が a + b * 2 になり、表示が別の意味になる
   const wrap = (text: string): string => (node.parentheses ? `(${text})` : text);
@@ -206,21 +306,45 @@ function exprToString(node: any): string {
       return parts.join('.') || '*';
     }
     case 'number':
-    case 'bool':
       return String(node.value);
+    case 'bool':
+      // パーサーは TRUE / FALSE を JavaScript の真偽値で持つ。ほかのキーワードと同じく大文字で書く
+      return String(node.value).toUpperCase();
     case 'string':
     case 'single_quote_string':
     case 'double_quote_string':
       return formatQuotedLiteral(node);
+    case 'natural_string':
+    case 'date':
+    case 'time':
+    case 'timestamp':
+    case 'datetime':
+      return formatPrefixedLiteral(node) ?? String(node.value);
+    case 'param':
+      // バインド変数 `:id`。コロンを落とすと列名の id に見える
+      return `:${formatIdentifier(node.value)}`;
     case 'null':
       return 'NULL';
     case 'star':
       return node.table ? `${node.table}.*` : '*';
     case 'expr_list':
-      return toArray(node.value)
-        .map((a: any) => exprToString(a))
-        .join(', ');
+      // 行の値 `(a, b) IN ((1, 2))` の括弧。IN の値の並びには parentheses が付かないので、括弧は二重にならない
+      return wrap(
+        toArray(node.value)
+          .map((a: any) => exprToString(a))
+          .join(', '),
+      );
     case 'binary_expr': {
+      // BETWEEN の上限と下限は、パーサーが値の並びで持つ。そのまま書くと `a BETWEEN 1, 5` になる
+      const betweenBounds =
+        /^(NOT\s+)?BETWEEN$/i.test(String(node.operator ?? '')) && node.right?.type === 'expr_list'
+          ? toArray<any>(node.right.value)
+          : [];
+      if (betweenBounds.length === 2) {
+        return wrap(
+          `${exprToString(node.left)} ${node.operator} ${exprToString(betweenBounds[0])} AND ${exprToString(betweenBounds[1])}`,
+        );
+      }
       // ESCAPE を落とすと LIKE の意味が変わって見える
       return wrap(
         `${exprToString(node.left)} ${node.operator} ${exprToString(node.right)}${formatEscapeClause(node)}`,
@@ -234,12 +358,31 @@ function exprToString(node: any): string {
       return `INTERVAL ${exprToString(node.expr)} ${String(node.unit ?? '').toUpperCase()}`.trim();
     case 'function': {
       const fnName = resolveFunctionName(node.name);
-      const args = formatFunctionArgs(extractFunctionArgs(node));
+      const rawArgs = extractFunctionArgs(node);
+      // 前処理で仮の名前にした集約（VARIANCE）の `DISTINCT(a)` は、元の `VARIANCE(DISTINCT a)` の形に戻す。
+      // Oracle に DISTINCT という関数は無いので、この形は前処理が作ったものだけ
+      const distinctArg = rawArgs.length === 1 ? rawArgs[0] : undefined;
+      if (distinctArg?.type === 'function' && resolveFunctionName(distinctArg.name) === 'DISTINCT' && !distinctArg.over) {
+        return `${fnName}(DISTINCT ${formatFunctionArgs(extractFunctionArgs(distinctArg))})${formatOverClause(node.over)}`;
+      }
+      const args = formatFunctionArgs(rawArgs);
+      // `a > ALL (SELECT …)` や `EXISTS (SELECT …)`。サブクエリの要約は括弧付きなので、関数の括弧を重ねない
+      if (/^(?:ALL|ANY|SOME|EXISTS)$/.test(fnName) && /^\(SELECT .*\)$/.test(args)) return `${fnName} ${args}`;
       return `${fnName}(${args})${formatOverClause(node.over)}`;
     }
     case 'aggr_func': {
-      const rawArgs = node.args?.expr ?? node.args?.value ?? node.args;
-      const distinctPrefix = node.args?.distinct ? 'DISTINCT ' : '';
+      let rawArgs = node.args?.expr ?? node.args?.value ?? node.args;
+      let distinctPrefix = node.args?.distinct ? 'DISTINCT ' : '';
+      // `SUM(DISTINCT a)` は前処理で `SUM(DISTINCT(a))` にしてから読むので、DISTINCT という名前の関数で来る
+      if (
+        !distinctPrefix &&
+        rawArgs?.type === 'function' &&
+        resolveFunctionName(rawArgs.name) === 'DISTINCT' &&
+        !rawArgs.over
+      ) {
+        distinctPrefix = 'DISTINCT ';
+        rawArgs = extractFunctionArgs(rawArgs);
+      }
       const args = toArray<any>(rawArgs)
         .map((a: any) => exprToString(a))
         .join(', ');
@@ -259,9 +402,13 @@ function exprToString(node: any): string {
     case 'cast': {
       return `CAST(${exprToString(node.expr)} AS ${formatCastTarget(node.target)})`;
     }
+    case 'datatype':
+      // 型を引数に取る関数の型。素通しすると AST の JSON が表示に出る
+      return formatCastTarget(node);
     case 'subquery': {
       const inner = node.subquery?.ast ?? node.subquery ?? node.ast;
       if (inner?.type === 'select') {
+        noteEmbeddedSubquery(inner);
         return summarizeSelect(inner);
       }
       return '(subquery)';
@@ -269,7 +416,10 @@ function exprToString(node: any): string {
     default: {
       // `SET col = (SELECT …)` のように、型を持たず ast だけを抱えたノードが来る
       const inner = extractSubquerySelectAst(node);
-      if (inner) return summarizeSelect(inner);
+      if (inner) {
+        noteEmbeddedSubquery(inner);
+        return summarizeSelect(inner);
+      }
       if (node.value !== undefined) return String(node.value);
       if (node.raw) return node.raw;
       return JSON.stringify(node);
@@ -301,9 +451,10 @@ function summarizeSelect(ast: any): string {
     const alias = first.as ?? 'derived';
     return `(SELECT ... AS ${alias})`;
   }
-  const table = first?.table ?? '?';
   const cols = toArray<any>(ast.columns).length;
-  return `(SELECT ${cols}列 FROM ${table})`;
+  // `EXISTS (SELECT 1 FROM DUAL)`。DUAL は名前を持たないので、そのままだと「FROM ?」になる
+  if (first?.type === 'dual') return `(SELECT ${cols}列 FROM DUAL)`;
+  return `(SELECT ${cols}列 FROM ${first?.table ?? '?'})`;
 }
 
 function normalizeSetOp(op: string | undefined): string {
@@ -361,6 +512,25 @@ function selectRange(ast: any): { start: number; end: number } | null {
   return { start, end: extendOverBlank(end) };
 }
 
+/**
+ * 集合演算（UNION など）の全体の範囲。最初のブランチの始まりから、最後のブランチの終わりまで。
+ * 最後のブランチの loc は後ろの空白まで伸びるので、取り除いた行制限句（全体に効くもの）もこの範囲に入る。
+ * 入れ子の SELECT を外側の SELECT の範囲から除くのに使う。最初のブランチの範囲だけを除くと、
+ * `(SELECT … UNION SELECT … FETCH FIRST 5 ROWS ONLY) d` の行制限句が外側の SELECT のものに見える
+ */
+function compoundSelectRange(ast: any): { start: number; end: number } | null {
+  const range = selectRange(ast);
+  if (!range) return null;
+  let last = ast;
+  while (last?._next) last = last._next;
+  const lastRange = last === ast ? null : selectRange(last);
+  let end = Math.max(range.end, lastRange?.end ?? range.end);
+  // 括弧で囲んだ最後のブランチの後ろの行制限句（`(…) UNION (…) FETCH FIRST 3 ROWS ONLY`）も全体のもの
+  const tail = last !== ast && last?.parentheses_symbol ? compoundTailRowLimit(last) : undefined;
+  if (tail) end = Math.max(end, tail.processedPos + 1);
+  return { start: range.start, end };
+}
+
 /** ast の内側にある別の SELECT（サブクエリ・CTE・UNION の後続ブランチ）の範囲 */
 function descendantSelectRanges(ast: any): Array<{ start: number; end: number }> {
   const ranges: Array<{ start: number; end: number }> = [];
@@ -377,7 +547,7 @@ function descendantSelectRanges(ast: any): Array<{ start: number; end: number }>
     }
 
     if (!isRoot && node.type === 'select') {
-      const inner = selectRange(node);
+      const inner = compoundSelectRange(node);
       if (inner) ranges.push(inner);
       // 入れ子の内側はこの範囲に含まれるので、これ以上下りる必要はない
       return;
@@ -443,6 +613,10 @@ interface RowLimitFields {
 
 function rowLimitForAst(ast: any): RowLimitFields {
   const [limit] = recordsOwnedBySelect(ast, rowLimits);
+  return rowLimitFields(limit);
+}
+
+function rowLimitFields(limit: RowLimitInfo | undefined): RowLimitFields {
   if (!limit) return {};
   return {
     limit: limit.count,
@@ -515,7 +689,7 @@ function parseWithClause(withClauses: any[] | null | undefined): CteRef[] {
     const innerAst = entry.stmt?.ast;
     const query =
       innerAst?.type === 'select'
-        ? buildSelectParsed(innerAst)
+        ? buildNestedSelect(innerAst)
         : buildSelectParsed({ type: 'select', columns: ['*'], from: [] });
     return {
       name,
@@ -613,7 +787,7 @@ function parseComparisonWithSubquery(node: any): ConditionNode {
         label: `${left} ${node.operator} ${summarizeSelect(subAst)}`,
         operator: node.operator,
         left,
-        nestedQuery: buildSelectParsed(subAst),
+        nestedQuery: buildNestedSelect(subAst),
       },
       node,
     );
@@ -672,7 +846,7 @@ function parseConditionTree(node: any): ConditionNode | undefined {
               label: `${left} ${node.operator} ${summarizeSelect(subAst)}`,
               operator: node.operator,
               left,
-              nestedQuery: buildSelectParsed(subAst),
+              nestedQuery: buildNestedSelect(subAst),
             },
             node,
           );
@@ -723,7 +897,7 @@ function parseConditionTree(node: any): ConditionNode | undefined {
           id: nextId('cond'),
           type: 'subquery',
           label: summarizeSelect(subAst ?? node),
-          nestedQuery: subAst ? buildSelectParsed(subAst) : undefined,
+          nestedQuery: subAst ? buildNestedSelect(subAst) : undefined,
         },
         node,
       );
@@ -739,7 +913,7 @@ function parseConditionTree(node: any): ConditionNode | undefined {
             id: nextId('cond'),
             type: 'exists',
             label: subAst ? `${op} ${summarizeSelect(subAst)}` : `${op} (subquery)`,
-            nestedQuery: subAst ? buildSelectParsed(subAst) : undefined,
+            nestedQuery: subAst ? buildNestedSelect(subAst) : undefined,
           },
           node,
         );
@@ -808,7 +982,7 @@ function parseConditionTree(node: any): ConditionNode | undefined {
             id: nextId('cond'),
             type: 'exists',
             label: subAst ? `EXISTS ${summarizeSelect(subAst)}` : 'EXISTS (subquery)',
-            nestedQuery: subAst ? buildSelectParsed(subAst) : undefined,
+            nestedQuery: subAst ? buildNestedSelect(subAst) : undefined,
           },
           node,
         );
@@ -881,8 +1055,15 @@ function parseColumns(columns: any[]): SelectColumn[] {
   });
 }
 
+const PARENTHESIZED_JOIN_MESSAGE =
+  '括弧でまとめた JOIN（例: a LEFT JOIN (b JOIN c ON …) ON …）には対応していません';
+
 function buildTableRef(entry: any, index: number): TableRef {
   const sourceSpan = toSourceSpan(entry.loc);
+
+  // `a LEFT JOIN (b JOIN c ON …) ON …` は括弧の中が配列で来る。
+  // 1 つのテーブルとして読むと b と c が図から消え、`table_1` という実在しない名前が出る
+  if (Array.isArray(entry.expr)) throw new Error(PARENTHESIZED_JOIN_MESSAGE);
 
   // Oracle の DUAL は 1 行 1 列のダミー表。パーサは table 名を持たない特別なノードを返す
   if (entry.type === 'dual') {
@@ -896,7 +1077,7 @@ function buildTableRef(entry: any, index: number): TableRef {
 
   if (entry.expr?.ast?.type === 'select') {
     const alias = entry.as ?? entry.alias ?? `derived_${index}`;
-    const derivedQuery = buildSelectParsed(entry.expr.ast);
+    const derivedQuery = buildNestedSelect(entry.expr.ast);
     const span = toSourceSpan(entry.expr?.loc) ?? derivedQuery.sourceSpan;
     return {
       id: nextId('tbl'),
@@ -928,7 +1109,7 @@ function parseJoinCondition(on: any): {
   parts?: { left: string; operator: string; right: string };
   conditionRoot?: ConditionNode;
 } {
-  if (!on) return { condition: '(no condition)' };
+  if (!on) return { condition: NO_JOIN_CONDITION };
 
   let conditionRoot = parseConditionTree(on);
   if (conditionRoot) conditionRoot = enrichConditionTree(conditionRoot);
@@ -994,7 +1175,7 @@ function parseUsingJoinCondition(
   conditionRoot?: ConditionNode;
 } {
   const columns = using.map(parseUsingColumnName).filter(Boolean);
-  if (columns.length === 0) return { condition: '(no condition)' };
+  if (columns.length === 0) return { condition: NO_JOIN_CONDITION };
 
   const comparisons = columns.map((col) => buildUsingComparison(col, source, target));
   const conditionRoot = enrichConditionTree(
@@ -1046,6 +1227,8 @@ function parseFromClause(from: any[]): FromClauseResult {
   const joins: JoinEdge[] = [];
   const commaJoinedIndexes: number[] = [];
 
+  // `FROM (a JOIN b ON …)` のように FROM 句全体を括弧で囲むと、配列ではなく 1 つのオブジェクトで来る
+  if (from && !Array.isArray(from)) throw new Error(PARENTHESIZED_JOIN_MESSAGE);
   if (!from || from.length === 0) return { tables, joins, commaJoinedIndexes };
 
   from.forEach((entry, index) => {
@@ -1066,7 +1249,7 @@ function parseFromClause(from: any[]): FromClauseResult {
     const isNatural = isNaturalJoinEntry(entry, prevEntry);
     let { condition, parts, conditionRoot } = parseJoinConditionFromEntry(entry, prevTable, tableRef);
 
-    if (isNatural && condition === '(no condition)') {
+    if (isNatural && condition === NO_JOIN_CONDITION) {
       condition = 'NATURAL JOIN';
     }
 
@@ -1254,7 +1437,7 @@ function deriveJoinsFromWhere(
       type: 'CROSS JOIN',
       sourceId: source.id,
       targetId: target.id,
-      condition: '(no condition)',
+      condition: NO_JOIN_CONDITION,
       fromWhereClause: true,
     });
   }
@@ -1262,7 +1445,12 @@ function deriveJoinsFromWhere(
   return joins;
 }
 
+/** 1 本の SELECT（UNION の 1 ブランチ）を解析する。UNION と WITH は呼び出し側が扱う */
 function buildSelectParsed(ast: any): ParsedQuery {
+  return collectEmbeddedSubqueries(() => buildSelectParsedCore(ast));
+}
+
+function buildSelectParsedCore(ast: any): ParsedQuery {
   const { tables, joins, commaJoinedIndexes } = parseFromClause(ast.from);
 
   let where = parseConditionTree(ast.where);
@@ -1278,10 +1466,7 @@ function buildSelectParsed(ast: any): ParsedQuery {
     sourceSpan: toSourceSpan(g.loc),
   }));
 
-  const orderBy: SqlFragment[] = toArray<any>(ast.orderby).map((o: any) => ({
-    text: `${exprToString(o.expr)}${o.type ? ` ${o.type}` : ''}${nullsOrderTextFor(o)}`,
-    sourceSpan: orderByEntrySourceSpan(o),
-  }));
+  const orderBy = parseOrderByEntries(ast.orderby);
 
   const hints = hintsForAst(ast);
 
@@ -1304,6 +1489,40 @@ function buildSelectParsed(ast: any): ParsedQuery {
   };
 }
 
+function parseOrderByEntries(entries: any): SqlFragment[] {
+  return toArray<any>(entries).map((o: any) => ({
+    text: `${exprToString(o.expr)}${o.type ? ` ${o.type}` : ''}${nullsOrderTextFor(o)}`,
+    sourceSpan: orderByEntrySourceSpan(o, processedSql),
+  }));
+}
+
+/**
+ * `(SELECT …) UNION (SELECT …) ORDER BY 1 FETCH FIRST 3 ROWS ONLY` のように、括弧で囲んだ最後のブランチの
+ * 後ろに書いた行制限句。前処理で取り除いた位置が、最後のブランチの閉じ括弧の外（集合演算の全体）にあるものを返す。
+ * 閉じ括弧の数で見るのは、派生テーブルの外（`(… UNION (…)) d FETCH …`）の行制限句と区別するため
+ */
+function compoundTailRowLimit(lastAst: any): RowLimitInfo | undefined {
+  const lastEnd = lastAst?.loc?.end?.offset;
+  if (typeof lastEnd !== 'number') return undefined;
+  return rowLimits.find((record) => {
+    if (record.processedPos < lastEnd) return false;
+    const between = maskNonCode(processedSql.slice(lastEnd, record.processedPos));
+    if (between.includes(';')) return false;
+    const closes = (between.match(/\)/g) ?? []).length;
+    const opens = (between.match(/\(/g) ?? []).length;
+    return closes - opens === 1;
+  });
+}
+
+/**
+ * 入れ子の SELECT（派生テーブル・CTE の本体・サブクエリ）を解析する。
+ * buildSelectParsed だけだと 2 本目以降の UNION ブランチと WITH 句を捨ててしまうので、
+ * 最上位と同じ手順で組み立てる
+ */
+function buildNestedSelect(ast: any): ParsedQuery {
+  return parseSelectQuery(ast, '');
+}
+
 function parseSelectQuery(ast: any, rawSql: string): ParsedQuery {
   const ctes = parseWithClause(ast.with);
   const branches = collectUnionBranches(ast);
@@ -1311,11 +1530,20 @@ function parseSelectQuery(ast: any, rawSql: string): ParsedQuery {
   main.rawSql = rawSql;
 
   if (branches.length > 1) {
-    // Oracle では ORDER BY / 行制限句は集合演算の結果全体に効く。
-    // パーサは最後のブランチに載せるので、文レベルへ引き上げる
-    const last = buildSelectParsed(branches[branches.length - 1]!.ast);
-    if (main.orderBy.length === 0 && last.orderBy.length > 0) main.orderBy = last.orderBy;
-    if (main.limit == null && main.offset == null && (last.limit != null || last.offset != null)) {
+    // Oracle では、括弧の無い最後のブランチの後ろの ORDER BY / 行制限句は集合演算の結果全体に効く。
+    // パーサは最後のブランチに載せるので、文レベルへ引き上げ、そのブランチからは外す。
+    // 外さないと、作用説明でそのブランチだけが「最大 3 行」のように絞られて見える。
+    // 括弧で囲んだ最後のブランチの ORDER BY / 行制限句は、そのブランチだけに効く
+    const lastAst = branches[branches.length - 1]!.ast;
+    const last = lastAst?.parentheses_symbol ? null : buildSelectParsed(lastAst);
+    // 括弧で囲んだブランチの後ろの ORDER BY は、パーサーが先頭の AST の _orderby に入れる
+    if (lastAst?.parentheses_symbol) {
+      if (ast._orderby && main.orderBy.length === 0) main.orderBy = parseOrderByEntries(ast._orderby);
+      const tail = compoundTailRowLimit(lastAst);
+      if (tail && main.limit == null && main.offset == null) Object.assign(main, rowLimitFields(tail));
+    }
+    if (last && main.orderBy.length === 0 && last.orderBy.length > 0) main.orderBy = last.orderBy;
+    if (last && main.limit == null && main.offset == null && (last.limit != null || last.offset != null)) {
       main.limit = last.limit;
       main.limitSpan = last.limitSpan;
       main.offset = last.offset;
@@ -1326,7 +1554,20 @@ function parseSelectQuery(ast: any, rawSql: string): ParsedQuery {
     }
 
     main.unionBranches = branches.map((branch, index) => {
-      const branchQuery = applyCtesToQuery(buildSelectParsed(branch.ast), ctes);
+      let branchQuery = applyCtesToQuery(buildSelectParsed(branch.ast), ctes);
+      if (last && branch.ast === lastAst) {
+        branchQuery = {
+          ...branchQuery,
+          orderBy: [],
+          limit: undefined,
+          limitSpan: undefined,
+          offset: undefined,
+          offsetSpan: undefined,
+          rowLimitPercent: undefined,
+          rowLimitWithTies: undefined,
+          rowLimitSpan: undefined,
+        };
+      }
       const sourceSpan = toSourceSpan(branch.ast?.loc);
       return {
         id: nextId('union'),
@@ -1342,6 +1583,22 @@ function parseSelectQuery(ast: any, rawSql: string): ParsedQuery {
   }
 
   return main;
+}
+
+/** SQL に書かれた集合演算子の数（maskNonCode 済みの SQL を渡す） */
+function countSetOperatorKeywords(masked: string): number {
+  return masked.match(/\b(?:UNION|MINUS|EXCEPT|INTERSECT)\b/gi)?.length ?? 0;
+}
+
+/** AST が持つ集合演算の数。サブクエリ・派生テーブル・CTE の中も数える */
+function countSetOperatorsInAst(node: any, seen: Set<unknown> = new Set()): number {
+  if (!node || typeof node !== 'object' || seen.has(node)) return 0;
+  seen.add(node);
+  let count = !Array.isArray(node) && node._next ? 1 : 0;
+  for (const [key, value] of Object.entries(node)) {
+    if (key !== 'loc') count += countSetOperatorsInAst(value, seen);
+  }
+  return count;
 }
 
 function parseSetClauses(set: any[]): SetClause[] {
@@ -1362,6 +1619,10 @@ function parseSetClauses(set: any[]): SetClause[] {
 }
 
 function parseUpdateAst(ast: any, rawSql: string): ParsedQuery {
+  return collectEmbeddedSubqueries(() => parseUpdateAstCore(ast, rawSql));
+}
+
+function parseUpdateAstCore(ast: any, rawSql: string): ParsedQuery {
   const { tables, joins, commaJoinedIndexes } = parseFromClause(ast.table);
 
   let where = parseConditionTree(ast.where);
@@ -1405,6 +1666,10 @@ function parseDeleteTargets(targets: any[], tables: TableRef[]): DeleteTarget[] 
 }
 
 function parseDeleteAst(ast: any, rawSql: string): ParsedQuery {
+  return collectEmbeddedSubqueries(() => parseDeleteAstCore(ast, rawSql));
+}
+
+function parseDeleteAstCore(ast: any, rawSql: string): ParsedQuery {
   const { tables, joins, commaJoinedIndexes } = parseFromClause(ast.from);
 
   let where = parseConditionTree(ast.where);
@@ -1485,10 +1750,19 @@ export function parseOracleQuery(sql: string): ParseResult {
     return { success: false, error: { message: unsupported } };
   }
 
+  // 位置（sourceSpan）は呼び出し元が渡した sql 上のオフセットで返す。
+  // 解析は前後の空白を取り除いた文字列で行うので、先頭の空白の分だけ後ろへずらす。
+  // ずらさないと、空行や字下げで始まる SQL でエディタの強調位置がその分だけ手前にずれる
+  const leadingTrim = sql.length - sql.trimStart().length;
+  /** 前処理後の SQL 上のオフセットと、入力 sql 上のオフセットの対応表。構文エラーの位置を戻すのに使う */
+  let processedToInputForError: number[] | null = null;
+
   try {
     const preprocessResult = preprocessSqlForParser(trimmed);
     const preprocessed = preprocessResult.sql;
     const processedToOriginal = preprocessResult.processedToOriginal;
+    processedToInputForError = processedToOriginal.map((offset) => offset + leadingTrim);
+    renamedFunctions = preprocessResult.renamedFunctions;
     naturalJoinStarts = preprocessResult.naturalJoinStarts;
     outerJoinMarkers = preprocessResult.outerJoinMarkers;
     hierarchicalClauses = preprocessResult.hierarchicalClauses;
@@ -1500,6 +1774,8 @@ export function parseOracleQuery(sql: string): ParseResult {
       database: 'MySQL',
       parseOptions: { includeLocations: true },
     });
+    // パーサーは WHERE などの中で AND と OR を同じ優先順位で結び付けるので、Oracle の優先順位で組み直す
+    fixLogicalOperatorPrecedence(ast);
     // 先頭 `;` などで astify が type を持たない空要素を返すことがある。文数に数えない
     const statements = (Array.isArray(ast) ? ast : [ast]).filter((statement) => statement?.type);
     const first = statements[0];
@@ -1518,20 +1794,36 @@ export function parseOracleQuery(sql: string): ParseResult {
       };
     }
 
-    const remap = (query: ParsedQuery) => remapParsedQuerySpans(processedToOriginal, query, trimmed);
+    // 前後の空白を除いた SQL の座標へ戻し、入力 sql の座標へずらしてから、範囲の後ろの空白とコメントを除く
+    const remap = (query: ParsedQuery) =>
+      trimParsedQuerySpanEnds(
+        shiftParsedQuerySpans(remapParsedQuerySpans(processedToOriginal, query, trimmed), leadingTrim),
+        sql,
+      );
 
     if (first.type === 'select') {
-      const query = parseSelectQuery(first, trimmed);
+      // `SELECT … UNION (SELECT …)` は右側のブランチがエラーにならずに AST から消えるか、別の形に化ける。
+      // サブクエリの中でも同じで、そのまま解析すると集合演算の無い SELECT として表示してしまう
+      if (countSetOperatorKeywords(maskNonCode(preprocessed)) > countSetOperatorsInAst(first)) {
+        return {
+          success: false,
+          error: {
+            message:
+              '集合演算（UNION / MINUS / INTERSECT）の一部のブランチを解析できませんでした。右側だけを括弧で囲む書き方（SELECT … UNION (SELECT …)）には対応していません。両側を括弧で囲むか、括弧を外してください',
+          },
+        };
+      }
+      const query = parseSelectQuery(first, sql);
       return { success: true, query: remap(query) };
     }
 
     if (first.type === 'update') {
-      const query = parseUpdateAst(first, trimmed);
+      const query = parseUpdateAst(first, sql);
       return { success: true, query: remap(query) };
     }
 
     if (first.type === 'delete') {
-      const query = parseDeleteAst(first, trimmed);
+      const query = parseDeleteAst(first, sql);
       return { success: true, query: remap(query) };
     }
 
@@ -1543,8 +1835,177 @@ export function parseOracleQuery(sql: string): ParseResult {
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : 'SQLの解析に失敗しました';
-    return { success: false, error: { message } };
+    const rawSpan = processedToInputForError
+      ? syntaxErrorSpan(err, processedToInputForError, sql)
+      : undefined;
+    if (!rawSpan) {
+      const reservedAlias = reservedAliasSpan(sql, message);
+      return {
+        success: false,
+        error: {
+          message: translateParserMessage(message),
+          ...(reservedAlias ? { position: reservedAlias.start, span: reservedAlias } : {}),
+        },
+      };
+    }
+    const cause = likelySyntaxErrorCause(sql, rawSpan.start, syntaxErrorFound(message) === null);
+    if (cause) {
+      return {
+        success: false,
+        error: { message: cause.message, detail: message, position: cause.span.start, span: cause.span },
+      };
+    }
+    // パーサーは 1 文字だけを指すので、語の途中で切れていたら語の終わりまで広げる（「ROW」を「R」とだけ示さない）
+    const span = extendSpanToWordEnd(sql, rawSpan);
+    const { line, column } = lineColumnAt(sql, span.start);
+    const found = syntaxErrorFound(message);
+    // 見つかった文字は、パーサーの文（前処理で書き換えたあとの SQL）からではなく、元の SQL のエラーの範囲から取る
+    const foundText = sql.slice(span.start, span.end).trim();
+    const summary =
+      found === undefined
+        ? `${line} 行 ${column} 列で構文を解釈できません（${message}）`
+        : found === null
+          ? `${line} 行 ${column} 列で構文を解釈できません（SQL が途中で終わっています）`
+          : foundText
+            ? `${line} 行 ${column} 列の「${foundText}」で構文を解釈できません`
+            : `${line} 行 ${column} 列で構文を解釈できません`;
+    return {
+      success: false,
+      error: {
+        message: summary,
+        ...(found === undefined ? {} : { detail: message }),
+        position: span.start,
+        span,
+      },
+    };
   }
+}
+
+/** span の始まりが語（識別子・キーワード）の文字なら、終わりを語の終わりまで広げる */
+function extendSpanToWordEnd(sql: string, span: SourceSpan): SourceSpan {
+  if (!isWordChar(sql[span.start])) return span;
+  let end = Math.max(span.end, span.start);
+  while (end < sql.length && isWordChar(sql[end])) end++;
+  return end === span.end ? span : { start: span.start, end };
+}
+
+const RESERVED_ALIAS_MESSAGE_RE = /^Error: "(.+)" is a reserved word, can not as alias clause$/;
+
+/** 予約語を別名にしたエラーは位置を持たないので、`AS 予約語` を元の SQL から探してエディタで示せるようにする */
+function reservedAliasSpan(sql: string, message: string): SourceSpan | undefined {
+  const reserved = RESERVED_ALIAS_MESSAGE_RE.exec(message);
+  if (!reserved) return undefined;
+  const word = reserved[1]!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(`\\bAS\\s+(${word})(?![\\w$#])`, 'i').exec(maskNonCode(sql));
+  if (!match) return undefined;
+  const start = match.index + match[0].length - match[1]!.length;
+  return { start, end: start + match[1]!.length };
+}
+
+/** 全角の空白と、半角に対応する全角の記号（，（）＝ など）。英数字の全角（ａ、１）は名前に使えるので含めない */
+const FULL_WIDTH_SEPARATOR_RE = /[　！-／：-＠［-｀｛-～]/;
+
+const UNCLOSED_LITERAL_LABELS: Record<string, string> = {
+  "'": '文字列',
+  '"': '引用識別子',
+  '/*': 'コメント',
+};
+
+/**
+ * パーサーのエラー位置より手前にある、本当の原因と考えられる所。
+ * - 閉じていない文字列・代替引用符・引用識別子・コメント。パーサーは SQL の末尾を指し、「途中で終わっています」のエラーになる
+ * - 全角の空白や記号。パーサーは全角の文字を名前の一部として読むので、`t　WHERE` は 1 つの名前になり、エラーはその先の語で出る
+ */
+function likelySyntaxErrorCause(
+  sql: string,
+  errorStart: number,
+  endedEarly: boolean,
+): { message: string; span: SourceSpan } | null {
+  const unclosed = findUnclosedLiteral(sql);
+  // `q'[abc` はパーサーが q を名前として読み、直後の `'` でエラーにする。エラーの位置が開始の記号の中にあるときも原因とみなす
+  const insideOpener =
+    unclosed !== null && errorStart >= unclosed.start && errorStart < unclosed.start + unclosed.opener.length;
+  if (unclosed && (endedEarly || insideOpener)) {
+    const at = lineColumnAt(sql, unclosed.start);
+    const what = UNCLOSED_LITERAL_LABELS[unclosed.opener] ?? '文字列（代替引用符）';
+    return {
+      message: `${at.line} 行 ${at.column} 列の「${unclosed.opener}」で始まる${what}が閉じていません`,
+      span: { start: unclosed.start, end: unclosed.start + unclosed.opener.length },
+    };
+  }
+  const masked = maskNonCode(sql);
+  const index = masked.slice(0, errorStart + 1).search(FULL_WIDTH_SEPARATOR_RE);
+  if (index < 0) return null;
+  const ch = masked[index]!;
+  const at = lineColumnAt(sql, index);
+  const message =
+    ch === '　'
+      ? `${at.line} 行 ${at.column} 列に全角の空白があります。全角の空白は語の区切りにならず、前後の語とつながった名前として読まれます。半角の空白にしてください`
+      : `${at.line} 行 ${at.column} 列の「${ch}」は全角の文字です。SQL の記号は半角（「${String.fromCharCode(ch.charCodeAt(0) - 0xfee0)}」）で書いてください`;
+  return { message, span: { start: index, end: index + 1 } };
+}
+
+/**
+ * 位置を持たない英語のエラーの文のうち、意味の分かるものを日本語にする。分からないものはそのまま返す。
+ * 予約語を別名の位置に書くと、node-sql-parser は位置の無いエラーを投げる。
+ * 予約語の一覧は SQL パーサー（MySQL ビルド）のもので、Oracle の予約語と同じとは限らない
+ */
+export function translateParserMessage(message: string): string {
+  const reserved = RESERVED_ALIAS_MESSAGE_RE.exec(message);
+  if (reserved) {
+    return `「${reserved[1]}」はこの解析では予約語として扱うので、そのままでは別名に使えません。別名にするなら二重引用符（"）で囲んでください`;
+  }
+  return message;
+}
+
+/**
+ * node-sql-parser（peggy）の構文エラーの文 `Expected "#", "$", ... but "x" found.` から、見つかった文字を取り出す。
+ * 入力の終わりで止まったときは null、この形の文でなければ undefined を返す。
+ * 文の大半は期待していた字句の一覧（数百文字の英語）で、そのまま出すと読めず、スクリーンリーダーも全部読み上げる
+ */
+export function syntaxErrorFound(message: string): string | null | undefined {
+  const match = /^Expected .* but (end of input|"((?:[^"\\]|\\.)*)") found\.$/s.exec(message);
+  if (!match) return undefined;
+  if (match[1] === 'end of input') return null;
+  try {
+    return JSON.parse(`"${match[2]}"`) as string;
+  } catch {
+    return match[2];
+  }
+}
+
+/** オフセットを 1 始まりの行・列に変える */
+export function lineColumnAt(text: string, offset: number): { line: number; column: number } {
+  const before = text.slice(0, offset);
+  const lastNewline = before.lastIndexOf('\n');
+  return { line: before.split('\n').length, column: offset - lastNewline };
+}
+
+/**
+ * node-sql-parser の構文エラー（location 付き）を、入力 sql 上の範囲に変える。
+ * location は前処理後の SQL 上のオフセットなので、対応表で入力の座標へ戻す。
+ * 入力の末尾で文が途切れたときは、最後の空白でない 1 文字を範囲にする（長さ 0 だとエディタに印を描けない）
+ */
+function syntaxErrorSpan(
+  err: unknown,
+  processedToInput: number[],
+  sql: string,
+): SourceSpan | undefined {
+  const location = (err as { location?: { start?: { offset?: unknown }; end?: { offset?: unknown } } })
+    ?.location;
+  const startOffset = location?.start?.offset;
+  if (typeof startOffset !== 'number') return undefined;
+  const endOffset = typeof location?.end?.offset === 'number' ? location.end.offset : startOffset;
+
+  const contentEnd = sql.trimEnd().length;
+  if (contentEnd === 0) return undefined;
+  const toInput = (offset: number): number =>
+    offset < processedToInput.length ? processedToInput[offset]! : contentEnd;
+
+  const start = toInput(startOffset);
+  if (start >= contentEnd) return { start: contentEnd - 1, end: contentEnd };
+  const end = Math.min(Math.max(toInput(endOffset), start + 1), contentEnd);
+  return { start, end };
 }
 
 export const SAMPLE_SQL = `SELECT /*+ LEADING(u o) USE_NL(o) */

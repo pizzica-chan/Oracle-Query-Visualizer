@@ -298,4 +298,157 @@ WHERE t.total > 1000`,
     sql: 'MERGE INTO t1 USING t2 ON (t1.id = t2.id) WHEN MATCHED THEN UPDATE SET t1.v = t2.v',
     expectSuccess: false,
   },
+  {
+    name: 'Oracle: AND は OR より先に結び付く',
+    category: 'regression',
+    sql: 'SELECT t.a FROM t WHERE t.a = 1 OR t.b = 2 AND t.c = 3',
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.where?.type !== 'or') throw new Error(`root should be OR, got ${q.where?.type}`);
+      if (q.where.children?.[1]?.type !== 'and') throw new Error('right side should be AND');
+    },
+  },
+  {
+    name: 'Oracle: 日本語の引用符なしのテーブル名・列名',
+    category: 'oracle',
+    sql: 'SELECT u.名前, o.金額 FROM ユーザー u LEFT JOIN 受注2 o ON o.ユーザーID = u.ID',
+    expectSuccess: true,
+    assert: (q) => {
+      if (tableNames(q).join(',') !== 'ユーザー,受注2') throw new Error(tableNames(q).join(','));
+    },
+  },
+  {
+    name: 'Oracle: 集約関数の DISTINCT と VARIANCE',
+    category: 'oracle',
+    sql: 'SELECT d.id, SUM(DISTINCT e.sal) AS s, VARIANCE(e.sal) AS v, AVG(DISTINCT e.bonus) AS b FROM dept d JOIN emp e ON e.dept_id = d.id GROUP BY d.id',
+    expectSuccess: true,
+    assert: (q) => {
+      const exprs = q.columns.map((c) => c.expression).join(' | ');
+      if (exprs !== 'd.id | SUM(DISTINCT e.sal) | VARIANCE(e.sal) | AVG(DISTINCT e.bonus)') throw new Error(exprs);
+    },
+  },
+  {
+    name: 'Oracle: UPDATE の SET 列 = DEFAULT',
+    category: 'update',
+    sql: 'UPDATE emp e SET e.bonus = DEFAULT, e.updated_at = SYSDATE WHERE e.id = :id',
+    expectSuccess: true,
+    assert: (q) => {
+      const labels = q.setClauses?.map((s) => s.label).join(' | ');
+      if (labels !== 'e.bonus = DEFAULT | e.updated_at = SYSDATE') throw new Error(labels);
+    },
+  },
+  {
+    name: 'Oracle: 日付・各国語のリテラルとバインド変数',
+    category: 'oracle',
+    sql: "SELECT e.id FROM emp e WHERE e.hired >= DATE '2024-04-01' AND e.kana = N'ア' AND e.dept_id = :dept",
+    expectSuccess: true,
+    assert: (q) => {
+      const labels = q.where?.children?.map((c) => c.label).join(' | ');
+      if (labels !== "e.hired >= DATE '2024-04-01' | e.kana = N'ア' | e.dept_id = :dept") throw new Error(labels);
+    },
+  },
+  {
+    name: '括弧でまとめた JOIN は未対応と伝える（table_1 という架空のテーブルにしない）',
+    category: 'error',
+    sql: 'SELECT a.x FROM a LEFT JOIN (b JOIN c ON c.id = b.cid) ON b.aid = a.id',
+    expectSuccess: false,
+    errorContains: '括弧でまとめた JOIN',
+  },
+  {
+    name: '集合演算の右側だけを括弧で囲むとブランチが消えるので、未対応と伝える',
+    category: 'error',
+    sql: 'SELECT a.x FROM a MINUS (SELECT b.x FROM b)',
+    expectSuccess: false,
+    errorContains: '右側だけを括弧で囲む',
+  },
+  {
+    name: '派生テーブル・IN サブクエリ・WITH の中の集合演算も、全ブランチを持つ',
+    category: 'union',
+    sql: `WITH c AS (SELECT a.x FROM a UNION ALL SELECT b.x FROM b)
+SELECT d.x FROM (SELECT p.x FROM p MINUS SELECT q.x FROM q) d
+WHERE d.x IN (SELECT c.x FROM c INTERSECT SELECT r.x FROM r)`,
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.ctes?.[0]?.query.unionBranches?.length !== 2) throw new Error('CTE branches');
+      if (q.tables.find((t) => t.isDerived && t.alias === 'd')?.derivedQuery?.unionBranches?.length !== 2) {
+        throw new Error('derived branches');
+      }
+      if (q.where?.nestedQuery?.unionBranches?.length !== 2) throw new Error('IN subquery branches');
+    },
+  },
+  {
+    name: '括弧の無い最後のブランチの後ろの ORDER BY / 行制限句は、集合演算の全体に掛かる',
+    category: 'union',
+    sql: 'SELECT a.x FROM a UNION ALL SELECT b.x FROM b ORDER BY 1 FETCH FIRST 3 ROWS ONLY',
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.limit !== '3' || q.orderBy.map((o) => o.text).join() !== '1') throw new Error(`tail: ${q.limit}`);
+      const last = q.unionBranches?.[1]?.query;
+      if (!last || last.limit !== undefined || last.orderBy.length > 0) throw new Error('last branch keeps tail');
+    },
+  },
+  {
+    name: '括弧で囲んだブランチの後ろの ORDER BY / 行制限句も全体に掛かり、派生テーブルの外へは出ない',
+    category: 'union',
+    sql: `SELECT d.x FROM ((SELECT a.x FROM a) UNION ALL (SELECT b.x FROM b) ORDER BY 1 FETCH FIRST 5 ROWS ONLY) d
+FETCH FIRST 2 ROWS ONLY`,
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.limit !== '2') throw new Error(`outer limit: ${q.limit}`);
+      const inner = q.tables[0]?.derivedQuery;
+      if (inner?.limit !== '5' || inner.orderBy.map((o) => o.text).join() !== '1') {
+        throw new Error(`inner tail: ${inner?.limit}`);
+      }
+    },
+  },
+  {
+    name: 'COLLATE・ウィンドウ枠・式の中の BETWEEN を表示に残す',
+    category: 'regression',
+    sql: `SELECT SUM(t.a) OVER (PARTITION BY t.k ORDER BY t.d ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s,
+  CASE WHEN t.b BETWEEN 1 AND 5 THEN 1 END AS c
+FROM t WHERE t.name COLLATE BINARY_CI = 'abc'`,
+    expectSuccess: true,
+    assert: (q) => {
+      const cols = q.columns.map((c) => c.expression).join(' | ');
+      if (cols !== 'SUM(t.a) OVER (PARTITION BY t.k ORDER BY t.d ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) | CASE WHEN t.b BETWEEN 1 AND 5 THEN 1 END') {
+        throw new Error(cols);
+      }
+      if (q.where?.label !== "t.name COLLATE BINARY_CI = 'abc'") throw new Error(q.where?.label);
+    },
+  },
+  {
+    name: '式の中のサブクエリを embeddedSubqueries に持つ（表示は要約のまま）',
+    category: 'subquery',
+    sql: 'SELECT u.id, (SELECT MAX(o.amt) FROM orders o WHERE o.uid = u.id) AS m FROM users u',
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.columns[1]?.expression !== '(SELECT 1列 FROM orders)') throw new Error(q.columns[1]?.expression);
+      if (q.embeddedSubqueries?.[0]?.tables[0]?.table !== 'orders') throw new Error('embedded');
+    },
+  },
+  {
+    name: 'ORDER BY の範囲は式と DESC の間の空白の数によらない',
+    category: 'regression',
+    sql: 'SELECT t.a FROM t ORDER BY t.a   DESC, t.b\n  ASC NULLS LAST',
+    expectSuccess: true,
+    assert: (q) => {
+      const sql = 'SELECT t.a FROM t ORDER BY t.a   DESC, t.b\n  ASC NULLS LAST';
+      const texts = q.orderBy.map((o) => sql.slice(o.sourceSpan!.start, o.sourceSpan!.end));
+      if (texts.join('|') !== 't.a   DESC|t.b\n  ASC') throw new Error(JSON.stringify(texts));
+    },
+  },
+  {
+    name: 'Oracle: 閉じていない代替引用符はエラーにする',
+    category: 'error',
+    sql: "SELECT e.id FROM emp e WHERE e.note = q'[abc",
+    expectSuccess: false,
+    errorContains: '閉じていません',
+  },
+  {
+    name: 'Oracle: 閉じていない引用識別子はエラーにする',
+    category: 'error',
+    sql: 'SELECT e."Name FROM emp e',
+    expectSuccess: false,
+    errorContains: '閉じていません',
+  },
 ];

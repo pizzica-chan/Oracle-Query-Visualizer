@@ -7,8 +7,14 @@ SQL の送信や外部 API 通信は行わず、**完全オフライン**で動�
 
 ### SQL 入力
 
-- リアルタイム解析（入力後 400ms）
-- シンタックスハイライト（Oracle のキーワード・`(+)` 演算子・ヒントコメント・引用識別子に対応）
+- リアルタイム解析（入力後 400ms）。Ctrl+Enter（Mac は Cmd+Enter）で待たずに解析
+- シンタックスハイライト（Oracle のキーワード・`(+)` 演算子・ヒントコメント・引用識別子に対応）と行番号
+- エディタの下のステータスバーに、解析の状態（未入力・解析中・解析済み・構文エラー）とカーソルの行・列を表示
+- Tab で字下げ、Shift+Tab で字下げを戻す（Esc を押してから Tab で、次の項目へフォーカスを移す）
+- 構文エラーのときは、行と列を表示し、該当箇所に波線を引く。「該当箇所へ移動」でカーソルをそこへ移す。パーサーが期待していた字句の一覧は、右側の「パーサーの詳細」を開くと読める
+  - 文字列・代替引用符・引用識別子・コメントが閉じていないときは、開始の記号の位置を示す。全角の空白や記号（`，` `＝` など）があるときは、その文字の位置を示して半角で書くよう案内する
+- 入力した SQL と表示オプションはブラウザ（localStorage）に保存し、リロードしても残る
+  - 入力していた SQL をサンプルで置き換えたときは、エディタの下の「元に戻す」か Ctrl+Z で前の SQL に戻せる
 - サンプル読み込み（SELECT / UNION / UPDATE / DELETE / (+) 結合 / CONNECT BY）
   - SELECT: 多段 JOIN・インラインビュー・相関 EXISTS / IN / NOT IN・オプティマイザヒント・`FETCH FIRST`
   - UNION: ブランチごとに JOIN・集約・インラインビュー・サブクエリ（`UNION ALL` / `MINUS`）
@@ -23,6 +29,8 @@ SQL の送信や外部 API 通信は行わず、**完全オフライン**で動�
 | **作用説明** | SQL が苦手な方向けの自然言語説明。JOIN を文章で説明し、要約・WHERE・集約・階層問い合わせを日本語で表示 |
 | **JOIN 図** | テーブル間の結合をインタラクティブなグラフで表示。UNION / MINUS 時はブランチごとの JOIN 図 |
 | **サブクエリ** | IN / EXISTS / インラインビューなどネストした SELECT を個別に解析（該当時のみ表示） |
+
+タブはキーボードでは選んでいるタブにフォーカスを置き、← → / Home / End で切り替えられます。
 
 ### Oracle 固有構文の扱い
 
@@ -40,8 +48,14 @@ SQL の送信や外部 API 通信は行わず、**完全オフライン**で動�
 
 ### その他
 
-- **エイリアスを実テーブル名で表示** — チェックで JOIN 図・条件・SQL構造の表示名を切り替え
+- **別名を実テーブル名で表示** — タブの並びの右端のチェックで、JOIN 図・条件・SQL構造の表示名を切り替え
   - 自己結合の別名（`e` / `m`）は切り替えても残します。同じ `employees` に潰すと「employees の行をすべて残し employees を LEFT JOIN」のように説明が読めなくなるためです。実テーブル名はテーブルのラベルに併記されます
+  - チェックを外したままでも、SQL構造・作用説明の別名（点線の下線付き）にマウスを載せると、実テーブル名が表示されます
+- **SQL と表示の連動** — 右側の要素をクリックすると、左の SQL の該当箇所が強調表示されます。逆に、左のエディタでカーソルを置いた語に対応する要素が、右側で枠に囲まれます（SQL構造・JOIN 図・サブクエリ）
+- **リンクをコピー** — 入力中の SQL を URL の `#` 以降に入れたリンクをコピーします。`#` 以降は HTTP リクエストに含まれないので、公開サイトで使ってもサーバーに SQL は送られません。リンクを開くとその SQL を読み込みます。読み込んだ SQL は編集するまで保存しないので、保存していた自分の SQL は残ります
+  - `file://` で開いた配布物のリンクは、受け取った人も同じ場所に配布物を置いていないと開けません
+  - リンクの一部が欠けているなどで読み込めないときは、ヘッダーにそのことを表示し、それまでの SQL をそのまま残します
+- **配色** — ヘッダーで自動（OS の設定に従う）・ライト・ダークを選べます。選んだ値はブラウザに保存します
 
 ## 起動方法（開発）
 
@@ -97,6 +111,7 @@ npm run ensure-dist         # push 前: 再ビルド + 検証 + dist 同期チ�
 ```bash
 npm test              # ユニットテスト一式
 npm run test:dist     # ビルド + オフライン監査・JOIN 図描画テスト
+npm run check:browser # ビルド + 実際の Chrome で dist/ を操作して確認（Chrome が必要。場所は CHROME_PATH でも指定できる）
 ```
 
 ## 対応範囲
@@ -111,7 +126,11 @@ npm run test:dist     # ビルド + オフライン監査・JOIN 図描画テス
 
 - JOIN: INNER / LEFT / RIGHT / FULL / CROSS、**NATURAL JOIN**、**JOIN USING**、カンマ結合（暗黙結合）、**旧式外部結合 `(+)`**
 - **WITH（副問合せファクタリング）** — 定義の解析と FROM 参照の紐付け、作用説明での表示
-- WHERE / HAVING: 比較、IN、BETWEEN、LIKE、IS NULL、EXISTS、NOT、AND / OR
+- WHERE / HAVING: 比較、IN、BETWEEN、LIKE、IS NULL、EXISTS、NOT、AND / OR（AND を OR より先に結び付ける Oracle の優先順位で解析）
+- 集約関数の `DISTINCT`（`SUM(DISTINCT x)` など）、`VARIANCE`、UPDATE の `SET 列 = DEFAULT`
+- リテラルとバインド変数は書いたとおりに表示（`DATE '2024-01-01'`、`TIMESTAMP '…'`、`N'…'`、`:id`）
+- 日本語などの ASCII 以外の文字を使った引用符なしの識別子（`FROM ユーザー u`）
+- 結合条件の無い結合（カンマ結合・CROSS JOIN）は、すべての行の組み合わせ（直積）として説明します
 - GROUP BY / ORDER BY（`NULLS FIRST` / `NULLS LAST`）/ 行制限句 / DISTINCT（`UNIQUE`）
 - 階層問い合わせ: `START WITH` / `CONNECT BY [NOCYCLE] [PRIOR]`
 - オプティマイザヒント `/*+ … */`
@@ -122,6 +141,7 @@ npm run test:dist     # ビルド + オフライン監査・JOIN 図描画テス
 
 - INSERT / MERGE / DDL / PL/SQL ブロックなど、SELECT / UPDATE / DELETE 以外
 - 複数文（`;` 区切りで 2 文以上）— 1 文目だけ解析して残りを黙って捨てないよう、エラーにします
+- 括弧でまとめた JOIN（`a LEFT JOIN (b JOIN c ON …) ON …`）と、集合演算の右側だけを括弧で囲む書き方（`SELECT … UNION (SELECT …)`）— SQL パーサーが一部のテーブルやブランチを読み飛ばすため、エラーにします
 - PIVOT / UNPIVOT、`GROUP BY GROUPING SETS`、MODEL 句、MATCH_RECOGNIZE、`CROSS APPLY` / `OUTER APPLY`、XMLTABLE / JSON_TABLE
 - ウィンドウ枠の境界に式を書く形（`RANGE BETWEEN UNBOUNDED PRECEDING AND (sal/2) PRECEDING`）
 - ウィンドウ関数の専用説明（構文としては解析します）

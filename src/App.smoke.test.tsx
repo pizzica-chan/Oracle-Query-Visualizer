@@ -48,15 +48,18 @@ function clickTab(container: HTMLElement, label: string): void {
 describe('App スモーク', () => {
   afterEach(() => {
     for (const container of containers.splice(0)) container.remove();
+    // 入力は localStorage に保存され、次のテストの起動時に復元される。テストごとに消す
+    window.localStorage.clear();
   });
 
   it('初期表示でサンプル読込ボタンを出す', async () => {
     const container = await renderApp();
-    // エディタのツールバーと welcome 画面の両方に同じ一覧が出る
-    const labels = new Set(
-      [...container.querySelectorAll('.sample-load-btn')].map((b) => b.textContent),
-    );
-    expect([...labels]).toEqual(['SELECT', 'UNION', 'UPDATE', 'DELETE', '(+) 結合', 'CONNECT BY']);
+    // エディタのツールバーと解析前の案内の両方に、同じ順でサンプルが並ぶ
+    const order = ['SELECT', 'UNION', 'UPDATE', 'DELETE', '(+) 結合', 'CONNECT BY'];
+    const toolbar = [...container.querySelectorAll('.sql-editor .sample-load-btn')].map((b) => b.textContent);
+    expect(toolbar).toEqual(order);
+    const cards = [...container.querySelectorAll('.welcome-samples .sample-card-label')].map((b) => b.textContent);
+    expect(cards).toEqual(order);
   });
 
   it.each([
@@ -109,7 +112,9 @@ describe('App スモーク', () => {
     const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
 
     await act(async () => {
-      textarea.value = 'これはSQLではない';
+      // React が変更を拾えるよう、ネイティブの setter で値を入れてから input を発火する
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
+      setter.call(textarea, 'これはSQLではない');
       textarea.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await act(async () => {

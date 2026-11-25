@@ -1,11 +1,57 @@
 import { describe, expect, it } from 'vitest';
-import { highlightSqlToHtml, tokenizeSql } from './sql-highlight';
+import { highlightSqlToHtml, highlightSqlToLineHtml, tokenizeSql } from './sql-highlight';
 
 function kinds(sql: string) {
   return tokenizeSql(sql).filter((t) => t.kind !== 'plain');
 }
 
 describe('sql-highlight', () => {
+  it('別名や列名の中の数字は数値の色にしない（u1、order2、t.1st）', () => {
+    const tokens = kinds('SELECT u1.id, t.1st, order2 FROM users u1, t WHERE u1.total > 10 AND x = .5 AND y = 1.5e3');
+    expect(tokens.filter((t) => t.kind === 'number').map((t) => t.text)).toEqual(['10', '.5', '1.5e3']);
+  });
+
+  it('日本語の識別子と、# や $ を含む識別子の数字は数値の色にしない', () => {
+    const tokens = kinds('SELECT テーブル1.列2, emp#1, x$2 FROM テーブル1 WHERE 列2 > 3');
+    expect(tokens.filter((t) => t.kind === 'number').map((t) => t.text)).toEqual(['3']);
+  });
+
+  it("N'…' は接頭辞も含めて 1 つの文字列として色分けする", () => {
+    const tokens = kinds("SELECT N'abc', nq'[x]', 'y' FROM dual");
+    expect(tokens.filter((t) => t.kind === 'string').map((t) => t.text)).toEqual(["N'abc'", "nq'[x]'", "'y'"]);
+  });
+
+  it('日本語の文字が続く語や、語の途中のキーワードはキーワードにしない（SELECT日付、selection、u_on）', () => {
+    const tokens = kinds('SELECT SELECT日付, selection, u_on FROM t');
+    expect(tokens.filter((t) => t.kind === 'keyword').map((t) => t.text)).toEqual(['SELECT', 'FROM']);
+  });
+
+  it('長い SQL でも短い時間で色分けする（文字ごとに正規表現を作り直さない）', () => {
+    const sql = Array.from(
+      { length: 1500 },
+      (_, i) => `SELECT u${i}.id, u${i}.name FROM users u${i} JOIN orders o${i} ON o${i}.user_id = u${i}.id WHERE o${i}.total > ${i}`,
+    ).join('\nUNION ALL\n');
+    const started = performance.now();
+    const restored = tokenizeSql(sql).map((t) => t.text).join('');
+    const elapsed = performance.now() - started;
+    expect(restored).toBe(sql);
+    // 直す前は 1 秒を超えていた。遅い CI でも通るよう、余裕を持たせる
+    expect(elapsed).toBeLessThan(400);
+  });
+
+  it('行ごとの HTML は行数と一致し、行をまたぐコメントは行の境目で span を閉じて開き直す', () => {
+    const sql = 'SELECT a /* 1\n2 */\nFROM t';
+    const lines = highlightSqlToLineHtml(sql);
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain('<span class="sql-hl--comment">/* 1</span>');
+    expect(lines[1]).toBe('<span class="sql-hl--comment">2 */</span>');
+  });
+
+  it('構文エラーの範囲に印を付ける', () => {
+    const html = highlightSqlToHtml('SELECT a,, b', undefined, { start: 9, end: 10 });
+    expect(html).toContain('<span class="sql-hl--error">,</span>');
+  });
+
   it('SELECT / JOIN キーワードをハイライトする', () => {
     const tokens = kinds('SELECT u.id FROM users u INNER JOIN orders o ON o.user_id = u.id');
     expect(tokens.some((t) => t.kind === 'keyword' && t.text.toUpperCase() === 'SELECT')).toBe(true);

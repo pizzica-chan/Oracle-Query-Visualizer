@@ -243,7 +243,7 @@ describe('join-effective-inner', () => {
           LEFT JOIN table_b b ON b.a_id = a.id
           WHERE b.col = 1
           GROUP BY a.id
-          HAVING COUNT(b.id) > 0
+          HAVING SUM(b.q) > 1
         `);
         const analysis = analysisForJoin(query, leftJoinByCondition(query, 'b.a_id')!.id);
         expect(analysis?.reasons.some((r) => r.kind === 'where')).toBe(true);
@@ -450,7 +450,7 @@ WHERE a.id = b.a_id(+)
           FROM table_a a
           LEFT JOIN table_b b ON b.a_id = a.id
           GROUP BY a.id
-          HAVING COUNT(b.id) >= 0
+          HAVING SUM(b.q) > 1
         `);
         const withHaving = normalizeEffectiveInnerJoins(query);
         expect(withHaving.joins[0]?.type).toBe('INNER JOIN');
@@ -466,7 +466,7 @@ WHERE a.id = b.a_id(+)
           LEFT JOIN table_b b ON b.a_id = a.id
           WHERE b.col = 1
           GROUP BY a.id
-          HAVING COUNT(b.id) >= 0
+          HAVING SUM(b.q) > 1
         `);
         const normalized = normalizeEffectiveInnerJoins(query, { ignoreHavingReasons: true });
         expect(normalized.joins[0]?.type).toBe('INNER JOIN');
@@ -623,5 +623,95 @@ ORDER BY d.dept_name, e.emp_no`);
       expect(line).toContain('SQL上は RIGHT JOIN');
       expect(line).toContain('後続の INNER JOIN により');
     });
+  });
+});
+
+describe('実質 INNER JOIN の根拠にする条件・しない条件', () => {
+  const analyze = (tail: string) =>
+    analyzeEffectiveInnerJoins(parseSql(`SELECT a.id FROM table_a a LEFT JOIN table_b b ON b.a_id = a.id ${tail}`));
+
+  it.each([
+    ['COUNT は未結合のグループで 0 を返す', 'GROUP BY a.id HAVING COUNT(b.id) = 0'],
+    ['COUNT(b.id) >= 0 は常に真になる', 'GROUP BY a.id HAVING COUNT(b.id) >= 0'],
+    ['REGR_COUNT は NULL を返さない', 'GROUP BY a.id HAVING REGR_COUNT(b.x, b.y) = 0'],
+    ['GROUP BY が無いと全体が 1 つのグループになる', 'HAVING SUM(b.q) > 1'],
+    ['ROLLUP の小計の行は未結合の行も含む', 'GROUP BY ROLLUP(a.id) HAVING SUM(b.q) > 1'],
+  ])('HAVING の集約を根拠にしない: %s', (_name, tail) => {
+    expect(analyze(tail)).toEqual([]);
+  });
+
+  it.each([
+    ['<> ALL は空のサブクエリで真になる', 'b.x <> ALL (SELECT y FROM t)'],
+    ['> ALL も空のサブクエリで真になる', 'b.x > ALL (SELECT y FROM t)'],
+    ['NOT (= ANY) は空のサブクエリで真になる', 'NOT (b.x = ANY (SELECT y FROM t))'],
+    ['NOT (IS NOT NULL) は IS NULL', 'NOT (b.x IS NOT NULL)'],
+    ['|| は片方が NULL でももう片方の値を返す', "b.x || 'a' = 'a'"],
+    ['CONCAT も || と同じ', "CONCAT(b.x, 'a') = 'a'"],
+    ['NVL は NULL を置き換える', 'NVL(b.x, 0) = 0'],
+    ['NVL2 は NULL のときの値を返す', 'NVL2(b.x, 1, 0) = 0'],
+    ['DECODE は NULL どうしを等しいとみなす', 'DECODE(b.x, NULL, 1, 0) = 1'],
+    ['パッケージのファンクションは何を返すか分からない', "pkg.upper(b.x) = 'A'"],
+    ['CASE は NULL を別の値に変えうる', 'CASE WHEN b.x IS NULL THEN 1 ELSE 0 END = 1'],
+    ['リスト側にだけ参照がある IN', 'a.id IN (b.x, 1)'],
+  ])('NULL でも真になりうる条件を根拠にしない: %s', (_name, where) => {
+    expect(analyze(`WHERE ${where}`)).toEqual([]);
+  });
+
+  it.each([
+    ['= ANY', 'b.x = ANY (SELECT y FROM t)', 'WHERE: b.x = ANY (SELECT 1列 FROM t)'],
+    ['NOT (<> ALL)', 'NOT (b.x <> ALL (SELECT y FROM t))', 'WHERE: NOT (b.x <> ALL (SELECT 1列 FROM t))'],
+    ['NOT (IS NULL)', 'NOT (b.x IS NULL)', 'WHERE: NOT (b.x IS NULL)'],
+    ['IS NOT NULL', 'b.x IS NOT NULL', 'WHERE: b.x IS NOT NULL'],
+    ['UPPER', "UPPER(b.x) = 'A'", "WHERE: UPPER(b.x) = 'A'"],
+    ['TO_CHAR', "TO_CHAR(b.d, 'YYYY') = '2024'", "WHERE: TO_CHAR(b.d, 'YYYY') = '2024'"],
+    ['引数の外にも参照がある NVL', 'NVL(b.x, 0) = b.y', 'WHERE: NVL(b.x, 0) = b.y'],
+  ])('NULL では真にならない条件を根拠にする: %s', (_name, where, label) => {
+    expect(analyze(`WHERE ${where}`)[0]?.reasons).toEqual([{ kind: 'where', label }]);
+  });
+
+  it('GROUP BY のある HAVING SUM は根拠にする', () => {
+    expect(analyze('GROUP BY a.id HAVING SUM(b.q) > 1')[0]?.reasons).toEqual([
+      { kind: 'having', label: 'HAVING: SUM(b.q) > 1' },
+    ]);
+  });
+
+  it('後続の INNER JOIN の ON に OR や NVL しか無いときは根拠にしない', () => {
+    const viaOr = parseSql(
+      'SELECT a.id FROM table_a a LEFT JOIN table_b b ON b.a_id = a.id INNER JOIN table_c c ON c.id = b.c_id OR c.id = a.c_id',
+    );
+    expect(analyzeEffectiveInnerJoins(viaOr)).toEqual([]);
+    const viaNvl = parseSql(
+      'SELECT a.id FROM table_a a LEFT JOIN table_b b ON b.a_id = a.id INNER JOIN table_c c ON c.id = NVL(b.c_id, a.c_id)',
+    );
+    expect(analyzeEffectiveInnerJoins(viaNvl)).toEqual([]);
+  });
+
+  it('旧式外部結合 (+) の後ろに、(+) の付かない結合条件で続くテーブルは根拠にする', () => {
+    const query = parseSql('SELECT a.id FROM table_a a, table_b b, table_c c WHERE a.id = b.a_id(+) AND b.c_id = c.id');
+    const analysis = analyzeEffectiveInnerJoins(query);
+    expect(analysis).toHaveLength(1);
+    expect(analysis[0]?.reasons.map((r) => r.kind)).toEqual(['inner_join']);
+  });
+});
+
+describe('実質 INNER JOIN の根拠 — NOT と後続の結合', () => {
+  const base = 'SELECT a.id FROM table_a a LEFT JOIN table_b b ON b.a_id = a.id';
+
+  it.each([
+    ['NOT の内側の AND（OR と同じ）', `${base} WHERE NOT (b.col = 1 AND a.flag = 2)`],
+    ['NOT IN サブクエリ（空なら真）', `${base} WHERE b.col NOT IN (SELECT x.col FROM x)`],
+    ['後続 INNER JOIN の ON が IS NULL', `${base} INNER JOIN table_c c ON c.a_id = a.id AND b.id IS NULL`],
+  ])('根拠にしない: %s', (_name, sql) => {
+    expect(analyzeEffectiveInnerJoins(parseSql(sql))).toEqual([]);
+  });
+
+  it.each([
+    ['NOT の内側の比較（NULL のまま）', `${base} WHERE NOT (b.col = 1)`],
+    ['NOT の内側の OR（AND と同じ）', `${base} WHERE NOT (b.col = 1 OR a.flag = 2)`],
+    ['IN サブクエリ', `${base} WHERE b.col IN (SELECT x.col FROM x)`],
+    ['日付の計算', `${base} WHERE b.created_at < SYSDATE - 30`],
+    ['後続 INNER JOIN の ON の AND の一方', `${base} INNER JOIN table_c c ON c.b_id = b.id AND c.kind = 1`],
+  ])('根拠にする: %s', (_name, sql) => {
+    expect(analyzeEffectiveInnerJoins(parseSql(sql))).toHaveLength(1);
   });
 });

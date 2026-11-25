@@ -1,5 +1,17 @@
 /** SQL 字句走査の共通ユーティリティ（ハイライト・前処理で共有） */
 
+/**
+ * 引用符なしの識別子に使える文字。Oracle はデータベースの文字セットの英数字と `_` `$` `#` を認める
+ * （Oracle Database 23 SQL Language Reference「Database Object Names and Qualifiers」）。
+ * 日本語の文字セットなら、カタカナや漢字も英数字に入る。ASCII だけで判定すると、`テーブル1` の 1 を数値の色にする
+ */
+const WORD_CHAR = /[\w$#\u0080-￿]/;
+
+/** ch が引用符なしの識別子（またはキーワード）に使える文字か */
+export function isWordChar(ch: string | undefined): boolean {
+  return ch !== undefined && WORD_CHAR.test(ch);
+}
+
 export interface CodeRegion {
   start: number;
   end: number;
@@ -217,4 +229,96 @@ export function maskNonCode(sql: string): string {
   }
   masked += ' '.repeat(sql.length - pos);
   return masked;
+}
+
+/**
+ * 閉じていない文字列（`'`）・代替引用符（`q'[`）・引用識別子（`"`）・ブロックコメント（`/*`）の開始位置。
+ * どれも閉じていれば null。読み取りの関数は閉じていないときも末尾の位置を返すので、閉じたかどうかはここで確かめ直す
+ */
+export function findUnclosedLiteral(sql: string): { start: number; opener: string } | null {
+  let i = 0;
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (isLineCommentStart(sql, i)) {
+      i = readLineCommentEnd(sql, i);
+      continue;
+    }
+    if (ch === '/' && sql[i + 1] === '*') {
+      const end = readBlockCommentEnd(sql, i);
+      if (end < i + 4 || sql.slice(end - 2, end) !== '*/') return { start: i, opener: '/*' };
+      i = end;
+      continue;
+    }
+    // `q'[…]'` は、直前が語の文字でないときだけ代替引用符になる（`seq'…'` の q は名前の一部）
+    const qQuote = isWordChar(sql[i - 1]) ? null : readQQuoteStart(sql, i);
+    if (qQuote) {
+      const end = readQQuoteEnd(sql, i)!;
+      if (end < qQuote.quoteCharIndex + 4 || sql.slice(end - 2, end) !== `${qQuote.terminator}'`) {
+        return { start: i, opener: sql.slice(i, qQuote.quoteCharIndex + 2) };
+      }
+      i = end;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      let j = i + 1;
+      let closed = false;
+      while (j < sql.length) {
+        if (sql[j] === ch) {
+          if (sql[j + 1] === ch) {
+            j += 2;
+            continue;
+          }
+          closed = true;
+          j += 1;
+          break;
+        }
+        // Oracle ではバックスラッシュはエスケープではない
+        j += 1;
+      }
+      if (!closed) return { start: i, opener: ch };
+      i = j;
+      continue;
+    }
+    i += 1;
+  }
+  return null;
+}
+
+/**
+ * 範囲の終端から、後ろに付いた空白とコメントを除いた終端を返す関数を作る。
+ * SQL パーサーの位置情報は要素の後ろの空白やコメントまで範囲に含めることがある。
+ * そのままだと、要素を選んだときにエディタで後ろのコメントまで強調し、
+ * カーソルがコメントや次の語の先頭にあるときも、手前の要素を対応する要素として選んでしまう。
+ * 文字列と引用識別子の中の空白は除かない。表は SQL 全体で 1 回だけ作る
+ */
+export function createTrailingTriviaTrimmer(sql: string): (start: number, end: number) => number {
+  // codeEndAt[i]: sql[0..i) のうち、空白とコメント以外の最後の文字の直後の位置
+  const codeEndAt = new Int32Array(sql.length + 1);
+  let lastCodeEnd = 0;
+  let i = 0;
+  const markTrivia = (to: number) => {
+    for (let k = i + 1; k <= to; k += 1) codeEndAt[k] = lastCodeEnd;
+    i = to;
+  };
+  const markCode = (to: number) => {
+    for (let k = i + 1; k <= to; k += 1) codeEndAt[k] = k;
+    lastCodeEnd = to;
+    i = to;
+  };
+  while (i < sql.length) {
+    const ch = sql[i]!;
+    const qQuoteEnd = isWordChar(sql[i - 1]) ? null : readQQuoteEnd(sql, i);
+    if (isLineCommentStart(sql, i)) markTrivia(readLineCommentEnd(sql, i));
+    else if (ch === '/' && sql[i + 1] === '*') markTrivia(readBlockCommentEnd(sql, i));
+    else if (qQuoteEnd != null) markCode(qQuoteEnd);
+    else if (ch === "'") markCode(readStringLiteralEnd(sql, i));
+    else if (ch === '"') markCode(readQuotedIdentifierEnd(sql, i));
+    else if (/\s/.test(ch)) markTrivia(i + 1);
+    else markCode(i + 1);
+  }
+  return (start, end) => {
+    if (end <= start || end > sql.length) return end;
+    const trimmed = codeEndAt[end]!;
+    return trimmed > start ? trimmed : end;
+  };
 }

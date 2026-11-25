@@ -24,10 +24,17 @@ export function columnEntrySourceSpan(col: any): SourceSpan | undefined {
   return toSourceSpan(col?.expr?.loc) ?? toSourceSpan(col?.loc);
 }
 
-export function orderByEntrySourceSpan(entry: any): SourceSpan | undefined {
+/**
+ * ORDER BY の 1 項目の範囲（式と、続く ASC / DESC）。
+ * sql を渡すと ASC / DESC の位置を実際の文字列から探す。式との間が空白 1 つとは限らない
+ * （`a.x   DESC` や改行）ので、決め打ちの長さを足すと範囲が方向キーワードの途中で切れる
+ */
+export function orderByEntrySourceSpan(entry: any, sql?: string): SourceSpan | undefined {
   const exprSpan = toSourceSpan(entry?.expr?.loc);
   if (!exprSpan) return undefined;
   if (!entry?.type) return exprSpan;
+  const direction = sql?.slice(exprSpan.end).match(/^\s*(?:asc|desc)\b/i);
+  if (direction) return { start: exprSpan.start, end: exprSpan.end + direction[0].length };
   const suffix = ` ${entry.type}`;
   return { start: exprSpan.start, end: exprSpan.end + suffix.length };
 }

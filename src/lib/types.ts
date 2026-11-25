@@ -172,11 +172,22 @@ export interface ParsedQuery {
   unionBranches?: UnionBranch[];
   /** WITH 句で定義された CTE */
   ctes?: CteRef[];
+  /**
+   * 式の中に書かれたサブクエリ（SELECT 列・関数の引数・ORDER BY・SET の右辺など）。出現順。
+   * 式の表示は `(SELECT 1列 FROM t)` のように要約するので、中身（別名の指す先など）はこちらで見る。
+   * 条件木の nestedQuery として持つサブクエリは含めない。
+   */
+  embeddedSubqueries?: ParsedQuery[];
 }
 
 export interface ParseError {
   message: string;
+  /** パーサーの元の文（期待していた字句の一覧など）。画面では折りたたんで出す */
+  detail?: string;
+  /** 構文エラーの開始位置（入力 SQL 上のオフセット） */
   position?: number;
+  /** 構文エラーの範囲（入力 SQL 上）。エディタで該当箇所に印を付けるのに使う */
+  span?: SourceSpan;
 }
 
 export type ParseResult =

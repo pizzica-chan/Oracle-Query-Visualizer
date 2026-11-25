@@ -1,5 +1,20 @@
 import type { ConditionNode, JoinEdge, ParsedQuery, TableRef } from './types';
 
+/**
+ * ON / USING の無い結合（カンマ結合・CROSS JOIN）に、パーサーが条件の代わりに入れる印。
+ * 比較や判定はこの値で行い、画面に出すときは joinConditionDisplayText を通す
+ */
+export const NO_JOIN_CONDITION = '(no condition)';
+
+/** 条件の無い結合の表示。CROSS JOIN とカンマ結合は、すべての行の組み合わせを作る */
+export const NO_JOIN_CONDITION_LABEL = '条件なし（すべての組み合わせ）';
+
+/** 結合条件の表示用の文字列。条件が無ければ NO_JOIN_CONDITION_LABEL を返す */
+export function joinConditionDisplayText(condition: string): string {
+  const trimmed = condition.trim();
+  return trimmed === '' || trimmed === NO_JOIN_CONDITION ? NO_JOIN_CONDITION_LABEL : condition;
+}
+
 function formatSubqueryInJoinLabel(query: ParsedQuery): string {
   const from = query.tables.map((t) => t.alias ?? t.table).join(', ');
   const firstCol = query.columns[0]?.expression;

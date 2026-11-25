@@ -334,7 +334,7 @@ WHERE a.id = b.a_id(+)
         LEFT JOIN table_b b ON b.a_id = a.id
         WHERE b.col = 1
         GROUP BY a.id
-        HAVING COUNT(b.id) > 0
+        HAVING SUM(b.q) > 1
       `;
       const join = joinFilterNodes(sql).find((n) =>
         collectLeafTexts(n.children![0]!).some((l) => l.includes('b.a_id = a.id')),
@@ -1021,5 +1021,135 @@ WHERE a.id = b.a_id(+)
       expect(inTexts.some((t) => t.startsWith('次の値のどれかと一致 —'))).toBe(true);
       expect(notInTexts.some((t) => t.startsWith('次の値のどれとも一致しない —'))).toBe(true);
     });
+  });
+});
+
+describe('条件の無い結合の説明', () => {
+  it.each([
+    ['カンマ結合', 'SELECT * FROM t1, t2'],
+    ['CROSS JOIN', 'SELECT * FROM t1 CROSS JOIN t2'],
+  ])('%s は、条件を満たす組み合わせではなく直積として説明する', (_label, sql) => {
+    const result = parseOracleQuery(sql);
+    if (!result.success) throw new Error(result.error.message);
+    const jpLines = lineTexts(buildQueryEffect(result.query, 'japanese').sections.find((s) => s.kind === 'scope'));
+    expect(jpLines.some((l) => l.includes('t1 と t2 の直積'))).toBe(true);
+    expect(jpLines.some((l) => l.includes('満たす組み合わせのみ残る'))).toBe(false);
+    expect(joinFilterNodes(sql)).toHaveLength(0);
+  });
+
+  it('内部の印 (no condition) を画面の文に出さない', () => {
+    const result = parseOracleQuery('SELECT * FROM t1, t2');
+    if (!result.success) throw new Error(result.error.message);
+    for (const mode of ['sql', 'japanese'] as const) {
+      expect(JSON.stringify(buildQueryEffect(result.query, mode))).not.toContain('(no condition)');
+    }
+  });
+});
+
+describe('集約の説明', () => {
+  it.each(['VAR_POP(o.x)', 'STDDEV_SAMP(o.x)', 'VARIANCE(o.x)', 'MEDIAN(o.x)', 'SUM(DISTINCT o.x)'])(
+    'GROUP BY なしの %s も全体集約として説明する',
+    (column) => {
+      const result = parseOracleQuery(`SELECT ${column} FROM orders o`);
+      if (!result.success) throw new Error(result.error.message);
+      expect(buildQueryEffect(result.query).summary).toContain('全体集約');
+      const agg = buildQueryEffect(result.query, 'japanese').sections.find((s) => s.kind === 'aggregate');
+      expect(lineTexts(agg)).toEqual(['集約関数のみ — 全体を1グループとして計算（結果は最大1行）']);
+    },
+  );
+
+  // OVER の付く集約は分析関数で、行をまとめずに各行へ値を付ける。文字列の中の SUM( は関数ではない
+  it.each(['SUM(o.x) OVER () AS s', 'COUNT(*) OVER (PARTITION BY o.k) AS c', "'SUM(x)' AS s"])(
+    '%s だけを選ぶ SELECT は全体集約と説明しない',
+    (column) => {
+      const result = parseOracleQuery(`SELECT ${column} FROM orders o`);
+      if (!result.success) throw new Error(result.error.message);
+      for (const mode of ['sql', 'japanese'] as const) {
+        const effect = buildQueryEffect(result.query, mode);
+        expect(effect.summary).not.toContain('集約');
+        expect(effect.sections.find((s) => s.kind === 'aggregate')).toBeUndefined();
+      }
+    },
+  );
+});
+
+describe('否定の付く条件の説明', () => {
+  // 否定を見ずに「範囲内」と書くと、逆の意味の説明になる。NOT LIKE も LIKE と言い方をそろえる
+  it.each([
+    ['t.a BETWEEN 1 AND 2', '範囲内 — t.a BETWEEN 1 AND 2'],
+    ['t.a NOT BETWEEN 1 AND 2', '範囲外 — t.a NOT BETWEEN 1 AND 2'],
+    ["t.a NOT LIKE 'x%'", "パターンに一致しない — t.a NOT LIKE 'x%'"],
+  ])('%s', (where, expected) => {
+    const result = parseOracleQuery(`SELECT t.a FROM t WHERE ${where}`);
+    if (!result.success) throw new Error(result.error.message);
+    const filter = buildQueryEffect(result.query, 'japanese').sections.find((s) => s.kind === 'filter');
+    expect(JSON.stringify(filter?.conditionRoot)).toContain(expected);
+  });
+});
+
+describe('作用説明の要約文', () => {
+  const summaryOf = (sql: string): string => {
+    const result = parseOracleQuery(sql);
+    if (!result.success) throw new Error(result.error.message);
+    return buildQueryEffect(result.query).summary;
+  };
+
+  // テーブル名に「行」を直接つないで「users行」「users、WHERE 条件を満たす行」と書いていた
+  it.each([
+    ['SELECT a FROM users', 'users の行が結果として表示される'],
+    ['SELECT a FROM users WHERE b = 1', 'users のうち、WHERE 条件を満たす行が結果として表示される'],
+    ['SELECT a FROM users u', 'users（u） の行が結果として表示される'],
+    ['SELECT a FROM t1, t2, t3', 't1 など 3 テーブルの組み合わせの行が結果として表示される'],
+    ['DELETE FROM users', 'users の行が削除される'],
+    ['SELECT SYSDATE FROM DUAL', '式の値が 1 行の結果として表示される'],
+    ['WITH c AS (SELECT a FROM t) SELECT a FROM c', 'c（CTE） の行が結果として表示される'],
+  ])('%s', (sql, expected) => {
+    expect(summaryOf(sql)).toBe(expected);
+  });
+});
+
+describe('対象テーブル欄の別名', () => {
+  it.each([
+    ['SELECT x.a FROM users x', 'users（x） の行'],
+    ['UPDATE users x SET x.a = 1', 'users（x） の行'],
+    ['SELECT a FROM hr.users', 'hr.users の行'],
+  ])('要約と同じ表記にする: %s', (sql, expected) => {
+    expect(scopeLines(sql)).toEqual([expected]);
+  });
+
+  it('日本語の説明の起点も同じ表記にする', () => {
+    const result = parseOracleQuery('SELECT x.a FROM users x JOIN orders o ON o.uid = x.id');
+    if (!result.success) throw new Error(result.error.message);
+    const scope = buildQueryEffect(result.query, 'japanese').sections.find((s) => s.kind === 'scope');
+    expect(lineTexts(scope)[0]).toBe('users（x） を起点に行の組み合わせを構成');
+  });
+});
+
+describe('集合演算の説明', () => {
+  const notesOf = (sql: string): string[] => {
+    const result = parseOracleQuery(sql);
+    if (!result.success) throw new Error(result.error.message);
+    return buildUnionQueryEffect(result.query)?.unionNotes ?? [];
+  };
+
+  // MINUS と INTERSECT を「縦に連結」と説明すると、行を除く・絞る演算が行を足す演算に見える
+  it('MINUS は、前の結果から行を除くと説明する', () => {
+    expect(notesOf('SELECT a.x FROM a MINUS SELECT b.x FROM b')).toEqual([
+      'MINUS — 前の結果から、この SELECT の結果にもある行を除く（残った行の重複は1行にまとめる）',
+    ]);
+  });
+
+  it('種類の違う集合演算は、それぞれを説明し、上から順に適用されると書く', () => {
+    const notes = notesOf('SELECT a.x FROM a UNION ALL SELECT b.x FROM b INTERSECT SELECT c.x FROM c');
+    expect(notes[0]).toMatch(/^UNION ALL — /);
+    expect(notes[1]).toMatch(/^INTERSECT — 前の結果とこの SELECT の結果の両方にある行だけを残す/);
+    expect(notes[2]).toBe('集合演算は、括弧が無ければ上から順に適用される');
+  });
+
+  it('集合演算の全体に掛かる行制限句を、最後のブランチだけの絞り込みとして説明しない', () => {
+    const result = parseOracleQuery('SELECT a.x FROM a UNION ALL SELECT b.x FROM b ORDER BY 1 FETCH FIRST 3 ROWS ONLY');
+    if (!result.success) throw new Error(result.error.message);
+    const effect = buildUnionQueryEffect(result.query);
+    expect(effect?.branches[1]?.effect.summary).toBe('b の行が結果として表示される');
   });
 });

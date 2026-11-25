@@ -6,12 +6,14 @@ import {
   effectiveInnerAnalysisByJoinId,
   formatEffectiveInnerJoinScopeLine,
   isInnerLikeJoin,
-  joinHasOnCondition,
+  isCartesianJoin,
   type EffectiveInnerAnalysis,
   type EffectiveInnerReason,
 } from './join-effective-inner';
+import { joinConditionDisplayText } from './join-condition';
 import { resolveJoinLayoutSources } from './join-graph-layout';
 import { hasUnion } from './query-utils';
+import { maskNonCode, readBalancedParenEnd } from './sql-lex';
 
 export type EffectAction = 'select' | 'update' | 'delete';
 
@@ -79,9 +81,28 @@ export interface QueryEffect {
   sections: QueryEffectSection[];
 }
 
-const AGGREGATE_FUNC_PATTERN =
-  /\b(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT|BIT_AND|BIT_OR|STD|STDDEV|VARIANCE)\s*\(/i;
-const COUNT_DISTINCT_PATTERN = /\bCOUNT\s*\(\s*DISTINCT\b/i;
+/**
+ * 集約関数の呼び出し（Oracle Database 23 SQL Language Reference「Aggregate Functions」の主なもの）。
+ * LISTAGG の WITHIN GROUP と KEEP は前処理で取り除くので、ここでは名前と括弧だけを見る
+ */
+const AGGREGATE_CALL_RE =
+  /(?<![\w$#.`"\u0080-\uFFFF])(?:COUNT|SUM|AVG|MIN|MAX|STDDEV|STDDEV_POP|STDDEV_SAMP|VARIANCE|VAR_POP|VAR_SAMP|MEDIAN|LISTAGG|COLLECT|CORR|COVAR_POP|COVAR_SAMP|REGR_\w+|APPROX_COUNT_DISTINCT|ANY_VALUE)\s*\(/giu;
+const COUNT_DISTINCT_PATTERN = /(?<![\w$#.`"\u0080-\uFFFF])COUNT\s*\(\s*DISTINCT\b/iu;
+
+/**
+ * 行をグループにまとめる集約関数を含むか。OVER の付く呼び出しは分析関数で、行をまとめずに各行へ値を付けるので数えない。
+ * 文字列リテラルの中の `SUM(` は関数ではないので、maskNonCode で隠してから探す
+ */
+function hasGroupingAggregate(col: SelectColumn): boolean {
+  const masked = maskNonCode(col.expression);
+  for (const match of masked.matchAll(AGGREGATE_CALL_RE)) {
+    const callEnd = readBalancedParenEnd(masked, match.index + match[0].length - 1);
+    if (callEnd !== null && /^\s*OVER\b/i.test(masked.slice(callEnd))) continue;
+    return true;
+  }
+  return false;
+}
+
 
 function columnLabel(col: SelectColumn): string {
   return col.alias ?? col.expression;
@@ -194,7 +215,7 @@ function formatLimitSummary(query: ParsedQuery): string {
 function describeAggregateLinesJapanese(query: ParsedQuery): EffectLine[] {
   if (query.statementType !== 'SELECT') return [];
 
-  const aggregateCols = query.columns.filter((c) => AGGREGATE_FUNC_PATTERN.test(c.expression));
+  const aggregateCols = query.columns.filter(hasGroupingAggregate);
   const countDistinctCols = query.columns.filter((c) => COUNT_DISTINCT_PATTERN.test(c.expression));
   const lines: EffectLine[] = [];
 
@@ -231,7 +252,7 @@ function describeAggregateLines(query: ParsedQuery, mode: QueryEffectMode): Effe
     }
   }
 
-  const aggregateCols = query.columns.filter((c) => AGGREGATE_FUNC_PATTERN.test(c.expression));
+  const aggregateCols = query.columns.filter(hasGroupingAggregate);
   for (const col of aggregateCols) {
     lines.push({
       text: formatSelectColumnSql(col),
@@ -257,10 +278,21 @@ function describeUnionCombination(query: ParsedQuery): string[] {
     return ['UNION — 各 SELECT の結果を縦に連結し、完全に同じ行は1行にまとめる'];
   }
 
-  return [
-    'UNION / UNION ALL — 各 SELECT の結果を縦に連結（UNION は重複行を除外、UNION ALL は残す）',
-  ];
+  // MINUS と INTERSECT は連結ではない。UNION と同じ説明にすると、行を除く・絞る演算が行を足す演算に見える。
+  // 集合演算子の優先順位はどれも同じで、括弧が無ければ上から順に評価する
+  // （Oracle Database 23 SQL Language Reference「The UNION [ALL], INTERSECT, MINUS Operators」）
+  const notes = operators.map((op) => SET_OPERATOR_NOTES[op] ?? `${op} — 集合演算で前の結果と組み合わせる`);
+  return operators.length > 1 ? [...notes, '集合演算は、括弧が無ければ上から順に適用される'] : notes;
 }
+
+/** 集合演算子ごとの説明。MINUS と INTERSECT は、重複の無い行を返す */
+const SET_OPERATOR_NOTES: Record<string, string> = {
+  'UNION ALL': 'UNION ALL — 前の結果に、この SELECT の結果をそのまま縦に連結（重複も残る）',
+  UNION: 'UNION — 前の結果に、この SELECT の結果を縦に連結し、完全に同じ行は1行にまとめる',
+  MINUS: 'MINUS — 前の結果から、この SELECT の結果にもある行を除く（残った行の重複は1行にまとめる）',
+  EXCEPT: 'EXCEPT — 前の結果から、この SELECT の結果にもある行を除く（残った行の重複は1行にまとめる）',
+  INTERSECT: 'INTERSECT — 前の結果とこの SELECT の結果の両方にある行だけを残す（重複は1行にまとめる）',
+};
 
 const JOIN_SCOPE: Record<string, (left: string, right: string, condition: string) => string> = {
   'INNER JOIN': (l, r, c) =>
@@ -303,6 +335,8 @@ function derivedTableLabelAlreadyPresent(name: string): boolean {
 }
 
 function tablePrimaryName(table: TableRef): string {
+  // WITH で定義した CTE も、解析結果では派生テーブル（isDerived）として持つ。ほかの欄と同じく「r（CTE）」と書き、派生テーブルと書かない
+  if (table.displayName.includes('（CTE）')) return table.displayName;
   if (table.isDerived) {
     const base = table.alias || table.table;
     return derivedTableLabelAlreadyPresent(base) ? base : `${base}（派生テーブル）`;
@@ -424,6 +458,15 @@ function describeOperationTarget(query: ParsedQuery): QueryEffectSection | null 
   }
 
   return null;
+}
+
+/**
+ * 対象テーブル欄の起点のテーブル。別名を付けたテーブルは、要約や参加テーブルの欄と同じく「users（u）」と書く。
+ * 別名だけ（「u の行」）だと、要約の「users（u） の行」と別のテーブルに見える
+ */
+function scopeTableLabel(table: TableRef): string {
+  if (!table.isDerived && table.alias && table.alias !== table.table) return tablePrimaryName(table);
+  return tableLabel(table);
 }
 
 function tableLabel(table: TableRef): string {
@@ -649,10 +692,10 @@ function describeJoinJapanese(
     return formatEffectiveInnerJoinScopeLine(join, preservedLabel, effectiveInner.nullableTable, effectiveInner.reasons);
   }
 
-  if (join.type === 'CROSS JOIN' && !joinHasOnCondition(join)) {
-    return sourceLabels.length > 1
-      ? `${sourcesText} と ${right} の直積（すべての組み合わせ）`
-      : `${left} と ${right} の直積（すべての組み合わせ）`;
+  // ON / USING の無い結合（CROSS JOIN とカンマ結合）は、すべての行の組み合わせを作る。
+  // 「結合条件を満たす組み合わせのみ残る」と書くと、条件があるように読める
+  if (isCartesianJoin(join)) {
+    return `${left} と ${right} の直積（すべての組み合わせ）`;
   }
 
   if (sourceLabels.length > 1) {
@@ -668,7 +711,8 @@ function crossJoinPhrase(join: JoinEdge, tables: TableRef[]): string {
   const sourceLabels = joinSourceLabels(join, tables);
   const right = tableName(join, tables, join.targetId);
   const left = sourceLabels.length === 1 ? sourceLabels[0]! : sourceLabels.join('、');
-  return `CROSS JOIN — ${left} と ${right} のすべての組み合わせ`;
+  if (join.type === 'CROSS JOIN') return `CROSS JOIN — ${left} と ${right} のすべての組み合わせ`;
+  return `${formatJoinDisplayType(join)} — ${left} と ${right} のすべての組み合わせ（結合条件が無いので CROSS JOIN と同じ）`;
 }
 
 function inConditionPhrase(node: ConditionNode): string {
@@ -698,9 +742,12 @@ function conditionPhrase(node: ConditionNode, mode: QueryEffectMode): string {
       return inConditionPhrase(node);
     case 'like':
       return `パターン一致 — ${node.label}`;
+    // NOT BETWEEN は範囲の外の行を残す。否定を見ずに「範囲内」と書くと逆の意味の説明になる
     case 'between':
-      return `範囲内 — ${node.label}`;
+      return `${/\bNOT\b/i.test(node.operator ?? '') ? '範囲外' : '範囲内'} — ${node.label}`;
     default:
+      // NOT LIKE は、パーサーが LIKE とは別の比較として返す
+      if (/^NOT\s+LIKE$/i.test(node.operator ?? '')) return `パターンに一致しない — ${node.label}`;
       return node.label;
   }
 }
@@ -835,7 +882,7 @@ function buildJoinConditionEffectNode(join: JoinEdge, mode: QueryEffectMode): Co
   return {
     id: `join-cond-${join.id}`,
     type: 'leaf',
-    text: join.condition,
+    text: joinConditionDisplayText(join.condition),
     sourceSpan: join.sourceSpan,
   };
 }
@@ -907,6 +954,8 @@ function isJoinRowFilter(
   join: JoinEdge,
   effectiveInner?: { nullableTable: TableRef; reasons: EffectiveInnerReason[] },
 ): boolean {
+  // 直積は行を絞り込まない。条件の無い結合を「結合条件」の節に入れると、条件の無い項目が並ぶ
+  if (isCartesianJoin(join)) return false;
   if (isInnerLikeJoin(join)) return true;
   return Boolean(effectiveInner);
 }
@@ -1055,13 +1104,13 @@ function describeScope(query: ParsedQuery, mode: QueryEffectMode): QueryEffectSe
       }
     }
     if (query.joins.length === 0) {
-      lines.push({ text: `${tableLabel(query.tables[0]!)} の行` });
+      lines.push({ text: `${scopeTableLabel(query.tables[0]!)} の行` });
     } else if (mode === 'japanese') {
       const classification = classifyTablePresenceRequirement(query);
       presenceGroups = buildTablePresenceGroups(classification, mode);
 
       lines.push({
-        text: `${tableLabel(query.tables[0]!)} を起点に行の組み合わせを構成`,
+        text: `${scopeTableLabel(query.tables[0]!)} を起点に行の組み合わせを構成`,
         sourceSpan: query.tables[0]?.sourceSpan,
       });
       pushOptimizerHintLines(lines, query);
@@ -1075,7 +1124,7 @@ function describeScope(query: ParsedQuery, mode: QueryEffectMode): QueryEffectSe
     } else {
       const classification = classifyTablePresenceRequirement(query);
       const optionalJoins = query.joins.filter((join) => {
-        if (join.type === 'CROSS JOIN') return false;
+        if (isCartesianJoin(join)) return false;
         const effectiveInner = effectiveInnerForJoin(join, query, effectiveInnerByJoin);
         return !isJoinRowFilter(join, effectiveInner);
       });
@@ -1088,7 +1137,7 @@ function describeScope(query: ParsedQuery, mode: QueryEffectMode): QueryEffectSe
       );
       pushOptimizerHintLines(lines, query);
       for (const join of query.joins) {
-        if (join.type === 'CROSS JOIN' && !joinHasOnCondition(join)) {
+        if (isCartesianJoin(join)) {
           lines.push({ text: crossJoinPhrase(join, query.tables) });
         }
       }
@@ -1173,9 +1222,23 @@ function primaryTarget(query: ParsedQuery): string {
 }
 
 function buildSummary(query: ParsedQuery, meta: (typeof ACTION_LABELS)[ParsedQuery['statementType']]): string {
-  const target = primaryTarget(query);
+  // `SELECT SYSDATE FROM DUAL` のように DUAL だけを読む SELECT は、式の値が 1 行だけ返る（DUAL は 1 行だけのダミー表）
+  if (
+    query.statementType === 'SELECT' &&
+    query.joins.length === 0 &&
+    query.tables.length === 1 &&
+    !query.tables[0]!.isDerived &&
+    query.tables[0]!.table.toUpperCase() === 'DUAL'
+  ) {
+    const condition = conditionTreeWithoutJoinConditions(query.where, query.joins) ? 'WHERE 条件を満たすときだけ、' : '';
+    return `${condition}式の値が 1 行の結果として${meta.verb}`;
+  }
+  // 「users の行」「users のうち、WHERE 条件を満たす行」。テーブル名と「行」の間に「の」を入れて文をつなぐ
+  const primary = primaryTarget(query);
+  // テーブル名や「（u）」の後ろは空白を空け、「組み合わせ」「3 テーブル」のような日本語の後ろは詰める
+  const target = /[\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Han}ー]$/u.test(primary) ? `${primary}の` : `${primary} の`;
   const filtered = conditionTreeWithoutJoinConditions(query.where, query.joins)
-    ? '、WHERE 条件を満たす'
+    ? 'うち、WHERE 条件を満たす'
     : '';
   const distinct = query.statementType === 'SELECT' && query.distinct ? '（重複行除外）' : '';
   const grouped =
@@ -1183,7 +1246,7 @@ function buildSummary(query: ParsedQuery, meta: (typeof ACTION_LABELS)[ParsedQue
       ? '（グループ集約後）'
       : query.statementType === 'SELECT' &&
           query.groupBy.length === 0 &&
-          query.columns.some((c) => AGGREGATE_FUNC_PATTERN.test(c.expression))
+          query.columns.some(hasGroupingAggregate)
         ? '（全体集約）'
         : '';
   const limit = formatLimitSummary(query);
