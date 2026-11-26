@@ -1433,9 +1433,31 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
   };
 }
 
+/**
+ * 前処理で取り除いた句（階層問い合わせ・行制限句・行ロック）の、元 SQL の座標の範囲。
+ * remapParsedQuerySpans の間だけ持つ。clipAtRemovedClause が使う
+ */
+let removedClauseSpans: SourceSpan[] = [];
+
+/**
+ * 取り除いた句は空白になり、その前の式の位置（loc）は後ろの空白、つまり取り除いた句まで含む。
+ * 元 SQL の座標に戻すと、`WHERE e.active = 1` の範囲が後ろの `START WITH … CONNECT BY …` まで延びる。
+ * 句の途中から始まらず、句の終わりまでで終わる範囲は、句の始まりで切る。
+ * 句の後ろに `)` や別名が続く範囲（`(SELECT … FETCH FIRST 1 ROWS ONLY) c`）は、句を中に含むので切らない
+ */
+function clipAtRemovedClause(span: SourceSpan): SourceSpan {
+  for (const clause of removedClauseSpans) {
+    if (span.start < clause.start && clause.start < span.end && span.end <= clause.end) {
+      return { start: span.start, end: clause.start };
+    }
+  }
+  return span;
+}
+
 export function remapSourceSpan(
   map: number[],
   span: SourceSpan | undefined,
+  clip = true,
 ): SourceSpan | undefined {
   if (!span || span.end <= span.start) return span;
   const start = map[span.start];
@@ -1443,7 +1465,27 @@ export function remapSourceSpan(
   const endAnchor = Math.min(Math.max(span.end - 1, span.start), map.length - 1);
   const endOrig = map[endAnchor];
   if (endOrig === undefined) return span;
-  return { start, end: endOrig + 1 };
+  const mapped = { start, end: endOrig + 1 };
+  return clip ? clipAtRemovedClause(mapped) : mapped;
+}
+
+/**
+ * remapParsedQuerySpans に、前処理で取り除いた句の範囲（元 SQL の座標）を渡して呼ぶ。
+ * 式の範囲が、後ろの取り除いた句まで延びないようにする（clipAtRemovedClause）
+ */
+export function remapParsedQuerySpansWithRemovedClauses(
+  map: number[],
+  query: ParsedQuery,
+  originalSql: string,
+  clauseSpans: SourceSpan[],
+): ParsedQuery {
+  const outer = removedClauseSpans;
+  removedClauseSpans = clauseSpans;
+  try {
+    return remapParsedQuerySpans(map, query, originalSql);
+  } finally {
+    removedClauseSpans = outer;
+  }
 }
 
 function remapSqlFragment(map: number[], fragment: SqlFragment): SqlFragment {
@@ -1540,7 +1582,8 @@ export function remapParsedQuerySpans(
 ): ParsedQuery {
   return {
     ...query,
-    sourceSpan: remapSourceSpan(map, query.sourceSpan),
+    // SELECT 自体の範囲は、その SELECT の階層問い合わせや行制限句を含むので切らない
+    sourceSpan: remapSourceSpan(map, query.sourceSpan, false),
     // 以下は前処理の時点で元 SQL 座標
     hintSpan: query.hintSpan,
     rowLimitSpan: query.rowLimitSpan,
@@ -1578,7 +1621,7 @@ export function remapParsedQuerySpans(
     })),
     unionBranches: query.unionBranches?.map((branch) => ({
       ...branch,
-      sourceSpan: remapSourceSpan(map, branch.sourceSpan),
+      sourceSpan: remapSourceSpan(map, branch.sourceSpan, false),
       query: remapParsedQuerySpans(map, branch.query, originalSql),
     })),
     embeddedSubqueries: query.embeddedSubqueries?.map((sub) => remapParsedQuerySpans(map, sub, originalSql)),

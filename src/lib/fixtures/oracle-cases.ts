@@ -443,6 +443,43 @@ WHERE t.total > 1000`,
     errorContains: '「b」との LEFT JOIN に ON（結合条件）がありません',
   },
   {
+    // パーサーは条件の位置を次の語の手前まで延ばす。取り除いた句の後ろに句が続くと、その句まで条件の範囲に入る
+    name: '取り除いた句（CONNECT BY）の前の条件の範囲は、その句まで延ばさない',
+    category: 'regression',
+    sql: `SELECT e.id, (SELECT d.n FROM dept d WHERE d.id = e.d FETCH FIRST 1 ROWS ONLY) dn
+FROM emp e
+WHERE e.active = 1
+START WITH e.mgr IS NULL
+CONNECT BY PRIOR e.id = e.mgr
+ORDER SIBLINGS BY e.id`,
+    expectSuccess: true,
+    assert: (q) => {
+      const sql = `SELECT e.id, (SELECT d.n FROM dept d WHERE d.id = e.d FETCH FIRST 1 ROWS ONLY) dn
+FROM emp e
+WHERE e.active = 1
+START WITH e.mgr IS NULL
+CONNECT BY PRIOR e.id = e.mgr
+ORDER SIBLINGS BY e.id`;
+      const text = (span?: { start: number; end: number }) => (span ? sql.slice(span.start, span.end) : null);
+      if (text(q.where?.sourceSpan) !== 'e.active = 1') throw new Error(JSON.stringify(text(q.where?.sourceSpan)));
+      // スカラーサブクエリの中の FETCH FIRST は、列の範囲に含めたまま
+      const column = text(q.columns[1]?.sourceSpan);
+      if (column !== '(SELECT d.n FROM dept d WHERE d.id = e.d FETCH FIRST 1 ROWS ONLY) dn') throw new Error(JSON.stringify(column));
+    },
+  },
+  {
+    name: 'インラインビューの中の FETCH FIRST の前の条件の範囲は、FETCH FIRST まで延ばさない',
+    category: 'regression',
+    sql: 'SELECT v.id FROM (SELECT e.id FROM emp e WHERE e.k = 2 FETCH FIRST 5 ROWS ONLY) v',
+    expectSuccess: true,
+    assert: (q) => {
+      const sql = 'SELECT v.id FROM (SELECT e.id FROM emp e WHERE e.k = 2 FETCH FIRST 5 ROWS ONLY) v';
+      const span = q.tables[0]?.derivedQuery?.where?.sourceSpan;
+      const text = span && sql.slice(span.start, span.end);
+      if (text !== 'e.k = 2') throw new Error(JSON.stringify(text));
+    },
+  },
+  {
     name: '関数の結果に続けてメソッドを呼ぶ書き方は、未対応と伝える（「.」の構文エラーにしない）',
     category: 'error',
     sql: 'SELECT XMLAGG(XMLELEMENT("e", e.name)).getClobVal() FROM emp e',

@@ -12,7 +12,7 @@ import { displayIdentifier, findUnclosedLiteral, isWordChar, readBalancedParenEn
 import {
   maskNonCode,
   preprocessSqlForParser,
-  remapParsedQuerySpans,
+  remapParsedQuerySpansWithRemovedClauses,
   shiftParsedQuerySpans,
   trimParsedQuerySpanEnds,
   type AggregateClauseInfo,
@@ -2090,9 +2090,18 @@ export function parseOracleQuery(sql: string): ParseResult {
     }
 
     // 前後の空白を除いた SQL の座標へ戻し、入力 sql の座標へずらしてから、範囲の後ろの空白とコメントを除く
+    // 前処理で取り除いた句の範囲。式の範囲がこれらの句まで延びないよう、位置を戻すときに切る
+    const removedClauseSpans = [
+      ...preprocessResult.hierarchicalClauses.map((c) => c.sourceSpan),
+      ...preprocessResult.rowLimits.map((r) => r.sourceSpan),
+      ...(preprocessResult.lockingClause ? [preprocessResult.lockingClause.sourceSpan] : []),
+    ];
     const remap = (query: ParsedQuery) =>
       trimParsedQuerySpanEnds(
-        shiftParsedQuerySpans(remapParsedQuerySpans(processedToOriginal, query, trimmed), leadingTrim),
+        shiftParsedQuerySpans(
+          remapParsedQuerySpansWithRemovedClauses(processedToOriginal, query, trimmed, removedClauseSpans),
+          leadingTrim,
+        ),
         sql,
       );
 
