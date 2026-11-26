@@ -1310,3 +1310,32 @@ describe('小計の行を作る GROUP BY と LATERAL', () => {
     expect(effectLines('SELECT e.id FROM emp e, (SELECT 1 x FROM dual) v').some((t) => t.includes('直積'))).toBe(true);
   });
 });
+
+describe('行ロックの指定', () => {
+  const effectLines = (sql: string, mode: 'sql' | 'japanese' = 'japanese') => {
+    const parsed = parseOracleQuery(sql);
+    if (!parsed.success) throw new Error(parsed.error.message);
+    return buildQueryEffect(parsed.query, mode).sections.flatMap((s) => s.lines ?? []);
+  };
+
+  it('FOR UPDATE は行をロックすると書き、OF・SKIP LOCKED・NOWAIT・WAIT も説明する', () => {
+    const sql = 'SELECT e.id FROM emp e WHERE e.dept_id = 10 FOR UPDATE OF e.sal SKIP LOCKED';
+    const lines = effectLines(sql);
+    expect(lines.map((l) => l.text)).toEqual(
+      expect.arrayContaining([
+        '行ロック（FOR UPDATE OF e.sal SKIP LOCKED） — 選んだ行は、トランザクションが終わるまでほかのセッションがロックも更新もできない',
+        'OF e.sal — 指定した列の表の行だけをロックする',
+        'SKIP LOCKED — ほかのトランザクションがロックしている行は、結果に入れずに飛ばす',
+      ]),
+    );
+    const span = lines.find((l) => l.text.startsWith('行ロック'))?.sourceSpan;
+    expect(span && sql.slice(span.start, span.end)).toBe('FOR UPDATE OF e.sal SKIP LOCKED');
+    expect(effectLines('SELECT e.id FROM emp e FOR UPDATE NOWAIT').map((l) => l.text)).toContain(
+      'NOWAIT — ロックできない行があれば、待たずにエラーにする',
+    );
+    expect(effectLines('SELECT e.id FROM emp e FOR UPDATE WAIT 5').map((l) => l.text)).toContain(
+      'WAIT 5 — ロックできるまで、最大 5 秒待つ',
+    );
+    expect(effectLines('SELECT e.id FROM emp e FOR UPDATE', 'sql').map((l) => l.text)).toContain('FOR UPDATE');
+  });
+});

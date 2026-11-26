@@ -168,6 +168,9 @@ export interface ParsedQuery {
   hints?: OptimizerHint[];
   /** 元 SQL 上のヒントコメント範囲（先頭のヒント） */
   hintSpan?: SourceSpan;
+  /** 行ロックの指定（`FOR UPDATE SKIP LOCKED` など）。文の最上位の SELECT だけが持つ */
+  lockingClause?: string;
+  lockingClauseSpan?: SourceSpan;
   /** 階層問い合わせ */
   hierarchical?: HierarchicalQuery;
   /** UNION / UNION ALL 等の各ブランチ（2本以上のとき） */

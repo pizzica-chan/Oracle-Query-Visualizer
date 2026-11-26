@@ -1148,6 +1148,31 @@ function keywordAt(masked: string, pos: number, keyword: string): boolean {
 }
 
 /**
+ * DUAL の範囲。パーサーは DUAL に位置を返さないので、SELECT の範囲の中の括弧の深さ 0 の `FROM DUAL` を探す。
+ * 範囲が無いと、JOIN 図のノードや作用説明の行をクリックしても、SQL と連動しない
+ */
+function fillDualSpan(tables: TableRef[], ast: any): TableRef[] {
+  const index = tables.findIndex((t) => t.table === 'dual' && !t.alias && !t.sourceSpan && !t.isDerived);
+  if (index < 0) return tables;
+  const astStart = ast?.loc?.start?.offset;
+  const astEnd = ast?.loc?.end?.offset;
+  if (typeof astStart !== 'number' || typeof astEnd !== 'number') return tables;
+  const masked = maskedProcessedSql();
+  let depth = 0;
+  for (let i = astStart; i < astEnd; i++) {
+    const ch = masked[i]!;
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    if (depth !== 0 || !keywordAt(masked, i, 'FROM')) continue;
+    const dual = /^\s+(DUAL)(?![\w$#])/i.exec(masked.slice(i + 'FROM'.length, astEnd));
+    if (!dual) return tables;
+    const start = i + 'FROM'.length + dual[0].length - dual[1]!.length;
+    return tables.map((t, k) => (k === index ? { ...t, sourceSpan: { start, end: start + dual[1]!.length } } : t));
+  }
+  return tables;
+}
+
+/**
  * パーサが位置（loc）を返さない列（CASE 式・文字列や数値・NULL など）の範囲を補う。
  * 範囲が無いと、その列をクリックしても、エディタのカーソルを置いても、SQL と連動しない。
  * SELECT の範囲の中で、括弧の深さ 0 の SELECT から FROM までを、深さ 0 のカンマで区切る
@@ -1703,7 +1728,7 @@ function buildSelectParsedCore(ast: any): ParsedQuery {
     rawSql: '',
     sourceSpan: toSourceSpan(ast?.loc),
     statementType: 'SELECT',
-    tables,
+    tables: fillDualSpan(tables, ast),
     joins: [...joins, ...derivedJoins],
     where,
     having,
@@ -2083,7 +2108,12 @@ export function parseOracleQuery(sql: string): ParseResult {
           },
         };
       }
-      const query = parseSelectQuery(first, sql);
+      const parsed = parseSelectQuery(first, sql);
+      const locking = preprocessResult.lockingClause;
+      // 行ロックの指定は、書いたとおりに表示する（OF の後ろの列名を大文字にしない）。範囲は前処理の時点で元 SQL の座標なので、remap では動かさない
+      const query = locking
+        ? { ...parsed, lockingClause: locking.text, lockingClauseSpan: locking.sourceSpan }
+        : parsed;
       return outerJoinRestrictionResult(remap(query), sql);
     }
 
@@ -2264,7 +2294,8 @@ function likelySyntaxErrorCause(
       missingSelectItemCause(sql, masked, errorStart) ??
       nestedSetOperationCause(masked) ??
       missingOperandCause(sql, masked, errorStart) ??
-      unbalancedParenCause(sql, masked, errorStart, endedEarly)
+      unbalancedParenCause(sql, masked, errorStart, endedEarly) ??
+      methodCallCause(sql, masked, errorStart)
     );
   }
   const ch = masked[index]!;
@@ -2404,6 +2435,28 @@ function missingOperandCause(
         span: { start: match.index, end: match.index + Math.max(1, word.length) },
       };
     }
+  }
+  return null;
+}
+
+/**
+ * 関数の結果に続けてメソッドを呼ぶ書き方（`XMLAGG(…).getClobVal()`）。SQL パーサーは読めず、`.` でエラーにする
+ */
+function methodCallCause(
+  sql: string,
+  masked: string,
+  errorStart: number,
+): { message: string; span: SourceSpan } | null {
+  const re = /\)(\s*)\.\s*[\p{L}_][\p{L}\p{N}_$#]*\s*\(/gu;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(masked)) !== null) {
+    const dot = match.index + 1 + match[1]!.length;
+    if (dot !== errorStart) continue;
+    const at = lineColumnAt(sql, dot);
+    return {
+      message: `${at.line} 行 ${at.column} 列の「.」から続く、関数の結果のメソッドを呼ぶ書き方（XMLAGG(…).getClobVal() など）には対応していません`,
+      span: { start: dot, end: dot + 1 },
+    };
   }
   return null;
 }

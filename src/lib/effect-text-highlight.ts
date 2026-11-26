@@ -148,8 +148,8 @@ function findBestMatch(
 ): MatchCandidate | null {
   const sqlString = readSqlQuotedString(text, pos, "'");
   if (sqlString) return sqlString;
-  const sqlDoubleString = readSqlQuotedString(text, pos, '"');
-  if (sqlDoubleString) return sqlDoubleString;
+  // Oracle の `"…"` は文字列ではなく引用識別子（`"E E".id`）。文字列として読むと、別名のツールチップが付かない
+
 
   if (text[pos] === '「') {
     const end = text.indexOf('」', pos + 1);

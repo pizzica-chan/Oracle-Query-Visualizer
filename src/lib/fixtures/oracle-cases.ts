@@ -443,6 +443,23 @@ WHERE t.total > 1000`,
     errorContains: '「b」との LEFT JOIN に ON（結合条件）がありません',
   },
   {
+    name: '関数の結果に続けてメソッドを呼ぶ書き方は、未対応と伝える（「.」の構文エラーにしない）',
+    category: 'error',
+    sql: 'SELECT XMLAGG(XMLELEMENT("e", e.name)).getClobVal() FROM emp e',
+    expectSuccess: false,
+    errorContains: '関数の結果のメソッドを呼ぶ書き方',
+  },
+  {
+    name: 'DUAL も SQL 上の範囲を持つ（JOIN 図のノードと SQL が連動する）',
+    category: 'oracle',
+    sql: 'SELECT 1 FROM  DUAL',
+    expectSuccess: true,
+    assert: (q) => {
+      const span = q.tables[0]?.sourceSpan;
+      if (!span || 'SELECT 1 FROM  DUAL'.slice(span.start, span.end) !== 'DUAL') throw new Error(JSON.stringify(span));
+    },
+  },
+  {
     name: '括弧の中で集合演算をまとめる書き方は、未対応と伝える',
     category: 'error',
     sql: '(SELECT x FROM t1 MINUS SELECT x FROM t2) INTERSECT SELECT x FROM t3',

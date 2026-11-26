@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { SAMPLE_SQL, parseOracleQuery } from './parser';
-import { segmentEffectText } from './effect-text-highlight';
+import { aliasTooltipFor, segmentEffectText } from './effect-text-highlight';
 import type { ParsedQuery } from './types';
 
 function kinds(text: string, query?: ParsedQuery) {
@@ -107,5 +107,16 @@ describe('effect-text-highlight', () => {
     expect(segments.some((s) => s.kind === 'column' && s.text === 'mydb.orders')).toBe(false);
     expect(segments.some((s) => s.kind === 'column' && s.text === 'o.user_id')).toBe(true);
     expect(segments.some((s) => s.kind === 'column' && s.text === 'u.id')).toBe(true);
+  });
+});
+
+describe('引用符で囲んだ別名のツールチップ', () => {
+  it('Oracle の "…" は文字列ではなく引用識別子として読み、別名のツールチップを付ける', () => {
+    const parsed = parseOracleQuery('SELECT "E E".id FROM sales "E E"');
+    if (!parsed.success) throw new Error(parsed.error.message);
+    const segments = segmentEffectText('"E E".id = 1', parsed.query);
+    expect(segments.some((s) => s.kind === 'string')).toBe(false);
+    const alias = segments.find((s) => s.text === 'E E');
+    expect(alias && aliasTooltipFor(alias, parsed.query)).toBe('E E は sales の別名');
   });
 });

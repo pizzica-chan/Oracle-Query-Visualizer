@@ -82,6 +82,12 @@ export interface NullsOrderInfo extends ProcessedAnchor {
   processedLength: number;
 }
 
+/** 行ロックの指定（`FOR UPDATE SKIP LOCKED` など）。sourceSpan は元 SQL の座標 */
+export interface LockingClauseInfo {
+  text: string;
+  sourceSpan: SourceSpan;
+}
+
 export interface PreprocessResult {
   sql: string;
   naturalJoinStarts: number[];
@@ -92,6 +98,8 @@ export interface PreprocessResult {
   nullsOrders: NullsOrderInfo[];
   /** CAST の型名を書き換えた位置と、元の型の書き方 */
   castTypes: CastTypeInfo[];
+  /** 取り除いた行ロックの指定。文の最上位の SELECT に持たせる */
+  lockingClause?: LockingClauseInfo;
   /** 取り除いた WITHIN GROUP (…) / KEEP (…) の位置と、元の書き方。表示では関数の後ろに戻す */
   aggregateClauses: AggregateClauseInfo[];
   /** ウィンドウ枠の RANGE を ROWS に置き換えた位置（前処理後 SQL 上）。表示では RANGE に戻す */
@@ -783,16 +791,26 @@ function forUpdateRanges(masked: string): Array<{ start: number; end: number }> 
  * 解析結果の形（対象テーブル・結合・条件）を変えない Oracle 固有の修飾を取り除く。
  * パーサはこれらを解さないため、残すと SQL 全体が解析できなくなる
  */
-function stripNonStructuralClauses(state: ProcessState): void {
+function stripNonStructuralClauses(state: ProcessState, sql: string): LockingClauseInfo | undefined {
   const masked = maskNonCode(state.sql);
+  const forUpdate = forUpdateRanges(masked);
   blankRanges(state, [
     ...matchRanges(masked, ORDER_SIBLINGS_RE, 1),
     ...matchRangesWithParen(masked, TABLE_PARTITION_RE),
     ...matchRangesWithParen(masked, SAMPLE_RE),
     ...flashbackRanges(state.sql, masked),
-    ...forUpdateRanges(masked),
+    ...forUpdate,
     ...matchRanges(masked, DB_LINK_RE),
   ]);
+  // 行ロックの指定は結果の行を変えないが、行をロックする作用なので、取り除く前の書き方を記録して作用説明に出す
+  const last = forUpdate[forUpdate.length - 1];
+  if (!last) return undefined;
+  const span = originalSpanForProcessedRange(state, last.start, last.end);
+  const written = sql.slice(span.start, span.end);
+  return {
+    text: written.replace(/\s+/g, ' ').trim(),
+    sourceSpan: { start: span.start, end: span.start + written.trimEnd().length },
+  };
 }
 
 // RANGE の後ろが境界のキーワードか数値のときだけ置き換える。INTERVAL などの式の境界はパーサが ROWS でも読めない
@@ -1366,7 +1384,7 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
   const nullsOrders = collectNullsOrders(state);
   state.anchors.push(...nullsOrders);
 
-  stripNonStructuralClauses(state);
+  const lockingClause = stripNonStructuralClauses(state, sql);
   const aggregateClauses = stripTrailingFunctionClauses(state, sql);
   state.anchors.push(...aggregateClauses);
   const rangeFrameStarts = rewriteRangeFrames(state);
@@ -1409,6 +1427,7 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
     castTypes,
     aggregateClauses,
     rangeFrameStarts,
+    lockingClause,
     processedToOriginal: state.processedToOriginal,
     renamedFunctions,
   };

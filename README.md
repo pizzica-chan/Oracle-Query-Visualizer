@@ -144,7 +144,7 @@ npm run check:browser # ビルド + 実際の Chrome で dist/ を操作して�
 - 括弧でまとめた JOIN（`a LEFT JOIN (b JOIN c ON …) ON …`）と、集合演算の右側だけを括弧で囲む書き方（`SELECT … UNION (SELECT …)`）— SQL パーサーが一部のテーブルやブランチを読み飛ばすため、エラーにします
 - 括弧の中で集合演算をまとめる書き方（`(SELECT … MINUS SELECT …) INTERSECT SELECT …`）— SQL パーサーが読めないため、エラーにします
 - PIVOT / UNPIVOT、`GROUP BY GROUPING SETS`、MODEL 句、MATCH_RECOGNIZE、`CROSS APPLY` / `OUTER APPLY`、XMLTABLE / JSON_TABLE、FROM 句の `TABLE(…)`
-- 再帰的な WITH の `SEARCH` 句と `CYCLE` 句、UPDATE / DELETE の `RETURNING … INTO`
+- 再帰的な WITH の `SEARCH` 句と `CYCLE` 句、UPDATE / DELETE の `RETURNING … INTO`、関数の結果に続けてメソッドを呼ぶ書き方（`XMLAGG(…).getClobVal()`）
 - ウィンドウ枠の境界に式や INTERVAL を書く形（`RANGE BETWEEN UNBOUNDED PRECEDING AND (sal/2) PRECEDING`、`RANGE INTERVAL '7' DAY PRECEDING`）
 - ウィンドウ関数の専用説明（構文としては解析します）
 - 実行計画・実際の行数取得（解析・可視化のみ）
