@@ -150,3 +150,11 @@ describe('書き忘れの原因が分かるエラー', () => {
     expect(errorOf('SELECT a.x FROM a GROUP BY a.x, a.y HAVING a.x =').message).toContain('SQL が途中で終わっています');
   });
 });
+
+describe('IS NOT で終わる SQL', () => {
+  it('IS NOT の後ろに要るのは条件ではなく NULL などなので、そう書く', () => {
+    const error = errorOf('SELECT e.id FROM emp e WHERE e.x IS NOT');
+    expect(error.message).toBe('1 行 34 列の「IS NOT」の後ろに NULL などがありません');
+    expect(errorOf('SELECT e.id FROM emp e WHERE e.x IS').message).toBe('1 行 34 列の「IS」の後ろに NULL などがありません');
+  });
+});

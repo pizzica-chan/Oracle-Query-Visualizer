@@ -2387,8 +2387,13 @@ const MISSING_OPERAND_RULES: Array<{ re: RegExp; message: (word: string) => stri
     message: () => '「,」の後ろに項目がありません。余分な「,」を消してください',
   },
   {
-    re: new RegExp(String.raw`\b(WHERE|AND|OR|ON|HAVING|NOT)\b\s*(?=$|\)|\b(?:${CLAUSE_WORDS})\b)`, 'gi'),
+    // `IS NOT` の NOT は条件ではなく NULL などを取るので、次の規則で扱う
+    re: new RegExp(String.raw`\b(WHERE|AND|OR|ON|HAVING|(?<!\bIS\s+)NOT)\b\s*(?=$|\)|\b(?:${CLAUSE_WORDS})\b)`, 'gi'),
     message: (word) => `「${word.toUpperCase()}」の後ろに条件がありません`,
+  },
+  {
+    re: new RegExp(String.raw`\b(IS(?:\s+NOT)?)\b\s*(?=$|\)|\b(?:${CLAUSE_WORDS})\b)`, 'gi'),
+    message: (word) => `「${word.toUpperCase().replace(/\s+/g, ' ')}」の後ろに NULL などがありません`,
   },
   {
     re: new RegExp(String.raw`\bSET\b\s*(?=$|\b(?:WHERE)\b)`, 'gi'),

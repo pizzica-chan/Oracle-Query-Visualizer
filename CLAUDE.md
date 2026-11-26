@@ -62,7 +62,7 @@ node-sql-parser に **Oracle 専用ビルドは無い**。全方言を実測し�
 
 - **node-sql-parser は WHERE・ON・HAVING の中で AND と OR を同じ優先順位として左から結び付ける**（`a OR b AND c` が `(a OR b) AND c` になる）。`parseOracleQuery` が `astify` の直後に `logical-precedence.ts` で組み直している。AST を自分で `astify` する経路を足すときも、この組み直しを通す。Oracle の `||` は文字列の連結なので、論理演算として扱わない（パーサーは比較より強く結び付け、連結として正しく読む）。
 
-- **`parser.ts` はモジュールレベルの可変状態を持つ**（`nodeCounter` / `naturalJoinStarts` / `outerJoinMarkers` / `hierarchicalClauses` / `rowLimits` / `optimizerHints` / `nullsOrders` / `processedSql` / `castTypes` / `aggregateClauses` / `rangeFrameStarts` / `renamedFunctions` / `embeddedSubqueryAsts`）。`parseOracleQuery` の先頭の `resetIds()` で毎回全消しする前提なので、解析を並行化したり再入させたりすると壊れる。
+- **`parser.ts` はモジュールレベルの可変状態を持つ**（`nodeCounter` / `naturalJoinStarts` / `outerJoinMarkers` / `hierarchicalClauses` / `rowLimits` / `optimizerHints` / `nullsOrders` / `processedSql` / `castTypes` / `aggregateClauses` / `rangeFrameStarts` / `renamedFunctions` / `embeddedSubqueryAsts` / `maskedProcessed` / `maskedProcessedFor`）。`parseOracleQuery` の先頭の `resetIds()` で毎回全消しする前提なので、解析を並行化したり再入させたりすると壊れる。
 
 - **前処理で取り除いた句は空白に置き換わり、AST の `loc` 範囲の外に出る**。どの SELECT に属するかは `recordsOwnedBySelect()` が「SELECT の範囲 + 後続の空白」で判定している。`selectRange()` の空白ぶんの延長を外すと、`FETCH FIRST` や `CONNECT BY` が末尾のクエリから外れて拾われなくなる。
 
