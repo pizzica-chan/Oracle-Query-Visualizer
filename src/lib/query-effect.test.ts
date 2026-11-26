@@ -1280,3 +1280,33 @@ describe('WITHIN GROUP / KEEP の付いた分析関数', () => {
     expect(effect.sections.some((s) => s.kind === 'aggregate')).toBe(false);
   });
 });
+
+describe('小計の行を作る GROUP BY と LATERAL', () => {
+  const effectLines = (sql: string, mode: 'sql' | 'japanese' = 'japanese') => {
+    const parsed = parseOracleQuery(sql);
+    if (!parsed.success) throw new Error(parsed.error.message);
+    return buildQueryEffect(parsed.query, mode).sections.flatMap((s) => s.lines ?? []).map((l) => l.text);
+  };
+
+  it('ROLLUP と CUBE は、小計と総計の行が加わると書く', () => {
+    expect(effectLines('SELECT e.d, SUM(e.s) FROM emp e GROUP BY ROLLUP (e.d, e.j)')).toContain(
+      'ROLLUP — 列の段階ごとの小計の行と、総計の行も加わる',
+    );
+    expect(effectLines('SELECT e.d, SUM(e.s) FROM emp e GROUP BY CUBE (e.d, e.j)')).toContain(
+      'CUBE — 列のすべての組み合わせごとの小計の行と、総計の行も加わる',
+    );
+  });
+
+  it('ROLLUP の外にも列があるときは、総計の行は作らないと書く', () => {
+    expect(effectLines('SELECT e.d, SUM(e.s) FROM emp e GROUP BY e.d, ROLLUP (e.j)')).toContain(
+      'ROLLUP — 列の段階ごとの小計の行も加わる（ROLLUP の外の列ごとに作り、総計の行は作らない）',
+    );
+  });
+
+  it('LATERAL のインラインビューは、直積ではなく左の表の行ごとに作ると書く', () => {
+    const sql = 'SELECT e.id, v.name FROM emp e, LATERAL (SELECT d.name FROM dept d WHERE d.id = e.dept_id) v';
+    expect(effectLines(sql).some((t) => t.startsWith('e の行ごとに v（派生テーブル） を作って組み合わせる'))).toBe(true);
+    expect(effectLines(sql, 'sql').some((t) => t.startsWith('LATERAL — e の行ごとに'))).toBe(true);
+    expect(effectLines('SELECT e.id FROM emp e, (SELECT 1 x FROM dual) v').some((t) => t.includes('直積'))).toBe(true);
+  });
+});

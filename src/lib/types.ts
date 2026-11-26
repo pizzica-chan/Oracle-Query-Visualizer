@@ -47,6 +47,8 @@ export interface TableRef {
   displayName: string;
   /** FROM句の派生テーブル `(SELECT ...) AS t` */
   isDerived?: boolean;
+  /** `LATERAL (SELECT …) v`。FROM 句で左にある表の列を参照できるインラインビュー */
+  isLateral?: boolean;
   derivedQuery?: ParsedQuery;
   /** 元 SQL 内のテーブル参照位置 */
   sourceSpan?: SourceSpan;

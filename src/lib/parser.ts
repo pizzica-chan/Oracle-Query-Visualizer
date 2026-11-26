@@ -1278,6 +1278,7 @@ function buildTableRef(entry: any, index: number): TableRef {
       alias: givenAlias,
       displayName: givenAlias ? `${name}（派生テーブル）` : `${name}（別名なし）`,
       isDerived: true,
+      isLateral: /^LATERAL$/i.test(String(entry.prefix ?? '')) || undefined,
       derivedQuery: span ? { ...derivedQuery, sourceSpan: span } : derivedQuery,
       sourceSpan: sourceSpan ?? derivedTableSourceSpan(span, givenAlias),
     };

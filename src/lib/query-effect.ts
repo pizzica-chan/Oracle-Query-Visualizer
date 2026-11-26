@@ -244,6 +244,22 @@ function describeAggregateLinesJapanese(query: ParsedQuery): EffectLine[] {
       text: `${query.groupBy.map((g) => g.text).join(', ')} ごとに集約 — 1グループ = 結果の1行`,
       sourceSpan: query.groupBy[0]?.sourceSpan,
     });
+    // ROLLUP と CUBE は、グループごとの行に加えて小計の行を作る。書かないと、結果の行がグループの数より多い理由が分からない
+    // （Oracle Database 23 Data Warehousing Guide「SQL for Aggregation in Data Warehouses」）。
+    // `GROUP BY a, ROLLUP (b)` のように外にも列があると、小計は a ごとに作り、総計の行は作らない
+    const subtotalKind = (g: { text: string }) => /^\s*(ROLLUP|CUBE)\s*\(/i.exec(g.text)?.[1]?.toUpperCase();
+    const withGrandTotal = query.groupBy.every((g) => subtotalKind(g));
+    for (const g of query.groupBy) {
+      const kind = subtotalKind(g);
+      if (!kind) continue;
+      const subtotals = kind === 'ROLLUP' ? '列の段階ごとの小計の行' : '列のすべての組み合わせごとの小計の行';
+      lines.push({
+        text: withGrandTotal
+          ? `${kind} — ${subtotals}と、総計の行も加わる`
+          : `${kind} — ${subtotals}も加わる（${kind} の外の列ごとに作り、総計の行は作らない）`,
+        sourceSpan: g.sourceSpan,
+      });
+    }
   } else if (aggregateCols.length > 0) {
     lines.push({ text: '集約関数のみ — 全体を1グループとして計算（結果は最大1行）' });
   }
@@ -719,6 +735,11 @@ function describeJoinJapanese(
   // ON / USING の無い結合（CROSS JOIN とカンマ結合）は、すべての行の組み合わせを作る。
   // 「結合条件を満たす組み合わせのみ残る」と書くと、条件があるように読める
   if (isCartesianJoin(join)) {
+    // LATERAL のインラインビューは、FROM 句で左にある表の列を参照できる（SQL Language Reference の SELECT の LATERAL。
+    // ページの文は要約でしか確かめていない）。左の表の行ごとに作るので、どの行とも組み合わせる直積とは読めない
+    if (tables.find((t) => t.id === join.targetId)?.isLateral) {
+      return `${left} の行ごとに ${right} を作って組み合わせる（LATERAL — ${right} は左にある表の列を参照できる）`;
+    }
     return `${left} と ${right} の直積（すべての組み合わせ）`;
   }
 
@@ -735,6 +756,9 @@ function crossJoinPhrase(join: JoinEdge, tables: TableRef[]): string {
   const sourceLabels = joinSourceLabels(join, tables);
   const right = tableName(join, tables, join.targetId);
   const left = sourceLabels.length === 1 ? sourceLabels[0]! : sourceLabels.join('、');
+  if (tables.find((t) => t.id === join.targetId)?.isLateral) {
+    return `LATERAL — ${left} の行ごとに ${right} を作って組み合わせる`;
+  }
   if (join.type === 'CROSS JOIN') return `CROSS JOIN — ${left} と ${right} のすべての組み合わせ`;
   return `${formatJoinDisplayType(join)} — ${left} と ${right} のすべての組み合わせ（結合条件が無いので CROSS JOIN と同じ）`;
 }
