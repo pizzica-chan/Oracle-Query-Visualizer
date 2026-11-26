@@ -207,3 +207,24 @@ describe('alias-resolver', () => {
     expect(resolved.deleteTargets?.map((d) => d.name).sort().join(',')).toBe('users');
   });
 });
+
+describe('引用符の要る名前と日本語の別名の置き換え', () => {
+  const resolvedColumns = (sql: string) => {
+    const parsed = parseOracleQuery(sql);
+    if (!parsed.success) throw new Error(parsed.error.message);
+    return applyAliasResolution(parsed.query, true).columns.map((c) => c.expression);
+  };
+
+  it('引用符で囲んで表示する別名も、実テーブル名に置き換える', () => {
+    expect(resolvedColumns('SELECT "E E".id FROM emp "E E"')).toEqual(['emp.id']);
+  });
+
+  it('日本語の別名も置き換え、置き換え先の名前に空白があれば引用符で囲む', () => {
+    expect(resolvedColumns('SELECT 売.id FROM sales 売')).toEqual(['sales.id']);
+    expect(resolvedColumns('SELECT t.id FROM "My Tab" t')).toEqual(['"My Tab".id']);
+  });
+
+  it('名前の途中の別名（売上b. の b）は置き換えない', () => {
+    expect(resolveAliasesInText('売上b.x = b.y', new Map([['b', 'orders']]))).toBe('売上b.x = orders.y');
+  });
+});

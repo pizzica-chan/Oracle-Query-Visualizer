@@ -1,4 +1,4 @@
-import { maskNonCode } from './sql-lex';
+import { displayIdentifier, maskLiteralsAndComments } from './sql-lex';
 import type { ConditionNode, JoinEdge, ParsedQuery, SetClause, DeleteTarget, TableRef } from './types';
 
 export interface AliasResolutionOptions {
@@ -16,6 +16,12 @@ function escapeRegExp(value: string): string {
 
 function physicalTableName(table: TableRef): string {
   return table.schema ? `${table.schema}.${table.table}` : table.table;
+}
+
+/** 置き換えに書く実テーブル名。空白などを含む名前は、式の表示と同じく引用符で囲む */
+function displayedPhysicalName(table: TableRef): string {
+  const name = displayIdentifier(table.table);
+  return table.schema ? `${displayIdentifier(table.schema)}.${name}` : name;
 }
 
 /** 同じ実テーブルを 2 回以上参照しているときの、その正規化名の集合 */
@@ -43,7 +49,7 @@ export function buildAliasMap(
     if (!t.alias || t.isDerived) continue;
     const physical = physicalTableName(t);
     if (selfJoined?.has(physical.toLowerCase())) continue;
-    map.set(t.alias, physical);
+    map.set(t.alias, displayedPhysicalName(t));
   }
   return map;
 }
@@ -55,14 +61,20 @@ export function buildAliasMap(
 export function resolveAliasesInText(text: string, aliasMap: Map<string, string>): string {
   if (!text || aliasMap.size === 0) return text;
 
-  const masked = maskNonCode(text);
+  // 式の表示は、引用符の要る別名を引用符で囲む（`"E E".id`）。その別名も探せるよう、引用符の中は伏せない
+  const masked = maskLiteralsAndComments(text);
   const aliases = [...aliasMap.keys()].sort((a, b) => b.length - a.length);
   const hits: Array<{ start: number; end: number; replacement: string }> = [];
 
   for (const alias of aliases) {
     const tableName = aliasMap.get(alias)!;
     // Oracle の識別子は引用しない限り大文字小文字を区別しない（`u` と `U` は同じ別名）
-    const qualified = new RegExp(`(?<![\\w.\`])${escapeRegExp(alias)}\\.`, 'gi');
+    // 前の文字が名前に使える文字でないことを確かめる（`売上b.` の b を別名 b と読まない）
+    const quotedAlias = '"' + escapeRegExp(alias.replace(/"/g, '""')) + '"';
+    const qualified = new RegExp(
+      '(?<![\\w$#\\u0080-\\uFFFF."])(?:' + escapeRegExp(alias) + '|' + quotedAlias + ')\\.',
+      'gi',
+    );
     let match: RegExpExecArray | null;
     while ((match = qualified.exec(masked)) !== null) {
       hits.push({
