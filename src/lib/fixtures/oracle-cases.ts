@@ -438,6 +438,40 @@ FROM t WHERE t.name COLLATE BINARY_CI = 'abc'`,
     },
   },
   {
+    name: '複数列の同時更新で複製した副問合せの範囲も、元の副問合せを指す',
+    category: 'update',
+    sql: `UPDATE employees e
+SET (e.dept_no, e.grade_cd) = (
+      SELECT d.dept_no, d.default_grade FROM departments d WHERE d.code = e.dept_code
+    )
+WHERE e.active = 1`,
+    expectSuccess: true,
+    assert: (q) => {
+      const sql = `UPDATE employees e
+SET (e.dept_no, e.grade_cd) = (
+      SELECT d.dept_no, d.default_grade FROM departments d WHERE d.code = e.dept_code
+    )
+WHERE e.active = 1`;
+      if (q.setClauses?.length !== 2) throw new Error(`set: ${q.setClauses?.length}`);
+      for (const sub of q.embeddedSubqueries ?? []) {
+        const span = sub.columns[0]?.sourceSpan;
+        if (span && sql.slice(span.start, span.end) !== 'd.dept_no') throw new Error(sql.slice(span.start, span.end));
+      }
+    },
+  },
+  {
+    name: 'Oracle: 別名の無いインラインビューに、内部の仮の名前や SQL に無い別名を出さない',
+    category: 'oracle',
+    sql: 'SELECT * FROM (SELECT a.*, ROWNUM rnum FROM (SELECT emp_no FROM employees ORDER BY emp_no) a WHERE ROWNUM <= 20) WHERE rnum > 10',
+    expectSuccess: true,
+    assert: (q) => {
+      const outer = q.tables[0];
+      if (outer?.table !== '派生テーブル1' || outer.alias !== undefined) throw new Error(JSON.stringify(outer?.table));
+      if (outer.displayName !== '派生テーブル1（別名なし）') throw new Error(outer.displayName);
+      if (outer.derivedQuery?.tables[0]?.alias !== 'a') throw new Error('inner alias');
+    },
+  },
+  {
     name: 'Oracle: 閉じていない代替引用符はエラーにする',
     category: 'error',
     sql: "SELECT e.id FROM emp e WHERE e.note = q'[abc",

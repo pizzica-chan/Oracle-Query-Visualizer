@@ -146,9 +146,11 @@ function spliceProcessed(
   start: number,
   end: number,
   inserted: string,
+  /** 挿入する文字ごとの元 SQL 上の位置。省くと、置き換える範囲の中へ順に配る */
+  explicitMap?: number[],
 ): void {
   const delta = inserted.length - (end - start);
-  const insertedMap = originalOffsetsForInsertion(state, start, end, inserted.length);
+  const insertedMap = explicitMap ?? originalOffsetsForInsertion(state, start, end, inserted.length);
   state.sql = state.sql.slice(0, start) + inserted + state.sql.slice(end);
   state.processedToOriginal = [
     ...state.processedToOriginal.slice(0, start),
@@ -856,7 +858,7 @@ function normalizeSelectModifiers(state: ProcessState): void {
 function expandMultiColumnUpdateSet(state: ProcessState): void {
   const masked = maskNonCode(state.sql);
   const setStarts = findWholeWordStarts(masked, 'SET');
-  const replacements: Array<{ start: number; end: number; inserted: string }> = [];
+  const replacements: Array<{ start: number; end: number; inserted: string; map: number[] }> = [];
 
   for (const setStart of setStarts) {
     // SET 句の終わり（WHERE / 文末 / 閉じ括弧）まで
@@ -884,25 +886,40 @@ function expandMultiColumnUpdateSet(state: ProcessState): void {
       const valueEnd = readBalancedParenEnd(masked, valueStart);
       if (valueEnd == null) break;
 
-      const columns = state.sql
-        .slice(i + 1, listEnd - 1)
-        .split(',')
-        .map((c) => c.trim())
-        .filter(Boolean);
+      const columns: Array<{ text: string; start: number }> = [];
+      let cursor = i + 1;
+      for (const raw of state.sql.slice(i + 1, listEnd - 1).split(',')) {
+        const text = raw.trim();
+        if (text) columns.push({ text, start: cursor + raw.length - raw.trimStart().length });
+        cursor += raw.length + 1;
+      }
       if (columns.length > 1) {
-        const value = state.sql.slice(valueStart, valueEnd);
-        replacements.push({
-          start: i,
-          end: valueEnd,
-          inserted: columns.map((column) => `${column} = ${value}`).join(', '),
+        // 複製した副問合せの文字は、元の副問合せの同じ文字の位置に対応させる。置き換える範囲の中へ順に配ると、
+        // 2 つ目以降の複製の中の範囲（式の中のサブクエリの列など）が、元の SQL の別の場所を指す
+        const orig = (pos: number): number => state.processedToOriginal[pos] ?? pos;
+        let inserted = '';
+        const map: number[] = [];
+        const push = (text: string, offsets: number[]) => {
+          inserted += text;
+          map.push(...offsets);
+        };
+        columns.forEach((column, index) => {
+          if (index > 0) push(', ', [orig(valueEnd - 1), orig(valueEnd - 1)]);
+          push(column.text, Array.from(column.text, (_, k) => orig(column.start + k)));
+          push(' = ', [orig(afterList), orig(afterList), orig(afterList)]);
+          push(
+            state.sql.slice(valueStart, valueEnd),
+            Array.from({ length: valueEnd - valueStart }, (_, k) => orig(valueStart + k)),
+          );
         });
+        replacements.push({ start: i, end: valueEnd, inserted, map });
       }
       i = valueEnd;
     }
   }
 
-  for (const { start, end, inserted } of replacements.reverse()) {
-    spliceProcessed(state, start, end, inserted);
+  for (const { start, end, inserted, map } of replacements.reverse()) {
+    spliceProcessed(state, start, end, inserted, map);
   }
 }
 

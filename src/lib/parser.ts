@@ -1076,14 +1076,18 @@ function buildTableRef(entry: any, index: number): TableRef {
   }
 
   if (entry.expr?.ast?.type === 'select') {
-    const alias = entry.as ?? entry.alias ?? `derived_${index}`;
+    // Oracle はインラインビューに別名を付けなくてよい（`SELECT * FROM (SELECT …) WHERE ROWNUM <= 10`）。
+    // 別名が無いときは、画面で読める名前を付ける。内部の仮の名前（derived_0）は SQL にも画面にも無い語になる
+    // 別名が無いときは別名を持たせない。SQL に無い別名を JOIN 図や別名のツールチップに出さないため
+    const givenAlias = entry.as ?? entry.alias;
+    const name = givenAlias ?? `派生テーブル${index + 1}`;
     const derivedQuery = buildNestedSelect(entry.expr.ast);
     const span = toSourceSpan(entry.expr?.loc) ?? derivedQuery.sourceSpan;
     return {
       id: nextId('tbl'),
-      table: alias,
-      alias,
-      displayName: `${alias} (派生テーブル)`,
+      table: name,
+      alias: givenAlias,
+      displayName: givenAlias ? `${name} (派生テーブル)` : `${name}（別名なし）`,
       isDerived: true,
       derivedQuery: span ? { ...derivedQuery, sourceSpan: span } : derivedQuery,
       sourceSpan,
