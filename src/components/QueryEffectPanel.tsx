@@ -152,6 +152,21 @@ export function QueryEffectBanner({
             />
           </div>
         ))}
+        {unionEffect.wholeResult && (
+          <div className="query-effect-banner-branch">
+            <div className="union-connector">結果全体</div>
+            <section className="query-effect query-effect--select">
+              <div className="query-effect-sections">
+                <EffectSection
+                  section={unionEffect.wholeResult}
+                  query={query}
+                  sourceLink={sourceLinkProps}
+                  mode={config.mode}
+                />
+              </div>
+            </section>
+          </div>
+        )}
       </div>
     );
   }

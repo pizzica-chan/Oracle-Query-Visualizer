@@ -229,6 +229,16 @@ async function shareChecks(b) {
   check('リロードすると自分の SQL に戻る', (await b.eval(`${textarea()}.value`)) === 'SELECT mine FROM t');
 }
 
+async function unionTailChecks(b) {
+  // 集合演算の結果全体に掛かる ORDER BY と件数の上限は、各ブランチの説明とは別に出す
+  await replaceText(b, 'SELECT x FROM t1 UNION ALL SELECT y FROM t2 ORDER BY 1 FETCH FIRST 3 ROWS ONLY');
+  await b.key('Enter', { keyCode: 13, modifiers: 2 });
+  await clickTab(b, '作用説明');
+  await sleep(300);
+  const text = await b.eval(`document.querySelector('.query-effect-banner')?.textContent ?? ''`);
+  check('集合演算の結果全体の並び順と件数の上限を、作用説明に出す', text.includes('結果全体') && text.includes('件数上限 — 最大 3 行'), text.slice(0, 80));
+}
+
 async function joinSpanChecks(b) {
   // テーブルや結合の形が変わらない編集では JOIN 図の配置を作り直さない。そのあいだもノードが指す SQL の範囲は新しくする
   await replaceText(b, 'SELECT mine FROM t');
@@ -260,6 +270,7 @@ try {
   await samplesAndThemeChecks(b);
   await shareChecks(b);
   await joinSpanChecks(b);
+  await unionTailChecks(b);
   await layoutChecks(b);
   check('操作の全体を通して例外とコンソールのエラーが出ない', b.errors().length === 0, b.errors().slice(0, 5).join(' | '));
 } catch (error) {

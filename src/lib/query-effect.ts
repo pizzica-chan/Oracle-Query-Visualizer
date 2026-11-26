@@ -341,10 +341,12 @@ function tablePrimaryName(table: TableRef): string {
     const base = table.alias || table.table;
     return derivedTableLabelAlreadyPresent(base) ? base : `${base}（派生テーブル）`;
   }
+  // schema 付きの表は schema も書く。対象テーブルの欄（displayName）と同じ名前にする
+  const physical = table.schema ? `${table.schema}.${table.table}` : table.table;
   if (table.alias && table.alias !== table.table) {
-    return `${table.table}（${table.alias}）`;
+    return `${physical}（${table.alias}）`;
   }
-  return table.table;
+  return physical;
 }
 
 function tableRefByName(tables: TableRef[], name: string): TableRef | undefined {
@@ -1298,6 +1300,11 @@ export function buildQueryEffect(query: ParsedQuery, mode: QueryEffectMode = 'sq
 export interface UnionQueryEffect {
   branches: Array<{ operator?: string; effect: QueryEffect }>;
   unionNotes: string[];
+  /**
+   * 集合演算の結果全体に掛かる ORDER BY・OFFSET・行制限。無ければ null。
+   * 各ブランチの説明には出ないので、別に出さないと、並び順や件数の上限が画面から消える
+   */
+  wholeResult: QueryEffectSection | null;
 }
 
 export function buildUnionQueryEffect(
@@ -1311,5 +1318,12 @@ export function buildUnionQueryEffect(
       operator: branch.operator,
       effect: buildQueryEffect(branch.query, mode),
     })),
+    wholeResult: describeUnionWholeResult(query, mode),
   };
+}
+
+function describeUnionWholeResult(query: ParsedQuery, mode: QueryEffectMode): QueryEffectSection | null {
+  // DISTINCT は最初のブランチのもので、結果全体のものではないので外す
+  const lines = describePostProcessLines({ ...query, distinct: false }, mode);
+  return lines.length > 0 ? { kind: 'info', title: '集合演算の結果全体の後処理', lines } : null;
 }

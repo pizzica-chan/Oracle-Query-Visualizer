@@ -1153,3 +1153,34 @@ describe('集合演算の説明', () => {
     expect(effect?.branches[1]?.effect.summary).toBe('b の行が結果として表示される');
   });
 });
+
+describe('schema 付きの表の名前', () => {
+  it('列・要約・結合の説明でも、対象テーブルの欄と同じく schema を書く', () => {
+    const plain = parseOracleQuery('SELECT sch.tab.k FROM sch.tab WHERE sch.tab.k = 1');
+    if (!plain.success) throw new Error(plain.error.message);
+    expect(plain.query.columns[0]?.expression).toBe('sch.tab.k');
+    expect(buildQueryEffect(plain.query, 'japanese').summary).toBe('sch.tab のうち、WHERE 条件を満たす行が結果として表示される');
+
+    const joined = parseOracleQuery('SELECT t.k FROM sch.tab t LEFT JOIN sch.u x ON x.k = t.k WHERE x.v > 0');
+    if (!joined.success) throw new Error(joined.error.message);
+    const effect = buildQueryEffect(joined.query, 'japanese');
+    expect(effect.summary.startsWith('sch.tab（t） と sch.u（x）')).toBe(true);
+    expect(effect.sections.flatMap((s) => s.lines ?? []).some((l) => l.text.includes('SQL 上は LEFT JOIN（sch.u（x） が無い行も'))).toBe(true);
+  });
+});
+
+describe('集合演算の結果全体に掛かる後処理', () => {
+  it('結果全体の ORDER BY と件数の上限を、各ブランチとは別に出す', () => {
+    const parsed = parseOracleQuery('SELECT DISTINCT x FROM t1 UNION ALL SELECT y FROM t2 ORDER BY 1 DESC FETCH FIRST 3 ROWS ONLY');
+    if (!parsed.success) throw new Error(parsed.error.message);
+    const effect = buildUnionQueryEffect(parsed.query, 'japanese');
+    expect(effect?.wholeResult?.lines?.map((l) => l.text)).toEqual(['並び順 — 1 DESC', '件数上限 — 最大 3 行']);
+    expect(effect?.branches.every((b) => !b.effect.summary.includes('最大'))).toBe(true);
+  });
+
+  it('結果全体の後処理が無ければ出さない', () => {
+    const parsed = parseOracleQuery('SELECT x FROM t1 UNION SELECT y FROM t2');
+    if (!parsed.success) throw new Error(parsed.error.message);
+    expect(buildUnionQueryEffect(parsed.query, 'japanese')?.wholeResult).toBeNull();
+  });
+});

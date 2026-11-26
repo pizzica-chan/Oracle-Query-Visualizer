@@ -362,6 +362,15 @@ WHERE t.total > 1000`,
     errorContains: '右側だけを括弧で囲む',
   },
   {
+    name: 'FROM がサブクエリのサブクエリを、内部の仮の名前（derived）を出さずに要約する',
+    category: 'subquery',
+    sql: 'DELETE FROM emp WHERE ROWID IN (SELECT rid FROM (SELECT ROWID rid, ROW_NUMBER() OVER (PARTITION BY code ORDER BY id) rn FROM emp) WHERE rn > 1)',
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.where?.label !== 'ROWID IN (SELECT 1列 FROM 派生テーブル)') throw new Error(q.where?.label);
+    },
+  },
+  {
     name: '列を書き忘れた SELECT は、原因が分かるエラーにする',
     category: 'error',
     sql: 'SELECT FROM employees',

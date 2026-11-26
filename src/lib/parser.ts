@@ -366,6 +366,8 @@ function exprToStringCore(node: any): string {
   switch (node.type) {
     case 'column_ref': {
       const parts: string[] = [];
+      // `sch.tab.k` の schema。落とすと、FROM の `sch.tab` と別の表に見える
+      if (node.db && node.table) parts.push(displayIdentifier(formatIdentifier(node.db)));
       if (node.table) parts.push(displayIdentifier(formatIdentifier(node.table)));
       if (node.column) parts.push(displayIdentifier(formatIdentifier(node.column)));
       return parts.join('.') || '*';
@@ -514,11 +516,9 @@ function extractSubquerySelectAst(node: any): any | null {
 function summarizeSelect(ast: any): string {
   const from = toArray<any>(ast.from);
   const first = from[0];
-  if (first?.expr?.ast?.type === 'select') {
-    const alias = first.as ?? 'derived';
-    return `(SELECT ... AS ${alias})`;
-  }
   const cols = toArray<any>(ast.columns).length;
+  // FROM がサブクエリなら、その別名で書く。別名が無ければ、画面に出す名前（派生テーブル）で書く
+  if (first?.expr?.ast?.type === 'select') return `(SELECT ${cols}列 FROM ${first.as ?? '派生テーブル'})`;
   // `EXISTS (SELECT 1 FROM DUAL)`。DUAL は名前を持たないので、そのままだと「FROM ?」になる
   if (first?.type === 'dual') return `(SELECT ${cols}列 FROM DUAL)`;
   return `(SELECT ${cols}列 FROM ${first?.table ?? '?'})`;

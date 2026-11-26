@@ -166,10 +166,11 @@ function tableDisplayLabel(table: TableRef): string {
     if (/派生テーブル/.test(table.displayName)) return table.displayName;
     return `${table.displayName}（派生テーブル）`;
   }
+  const physical = table.schema ? `${table.schema}.${table.table}` : table.table;
   if (table.alias && table.alias !== table.table) {
-    return `${table.table}（${table.alias}）`;
+    return `${physical}（${table.alias}）`;
   }
-  return table.table;
+  return physical;
 }
 
 function innerJoinReasonLabel(join: JoinEdge, tables: TableRef[]): string {
