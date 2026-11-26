@@ -741,3 +741,27 @@ describe('後続の外部結合が実質 INNER JOIN になると、その結合�
     expect(analyses).toHaveLength(1);
   });
 });
+
+describe('OR のすべての枝が NULL をはじくとき', () => {
+  const analyze = (where: string) =>
+    analyzeEffectiveInnerJoins(parseSql(`SELECT a.id FROM table_a a LEFT JOIN table_b b ON b.a_id = a.id WHERE ${where}`));
+
+  it.each([
+    ['b.x = 1 OR b.z = 2', 'WHERE: b.x = 1 OR b.z = 2'],
+    ['a.y = 1 AND (b.x = 1 OR b.z = 2)', 'WHERE: b.x = 1 OR b.z = 2'],
+    ['(b.x = 1 AND a.y = 2) OR b.x = 3', 'WHERE: (b.x = 1 AND a.y = 2) OR b.x = 3'],
+    ['NOT (b.x IS NULL AND b.z IS NULL)', 'WHERE: NOT (b.x IS NULL AND b.z IS NULL)'],
+  ])('根拠にする: %s', (where, label) => {
+    const analyses = analyze(where);
+    expect(analyses).toHaveLength(1);
+    expect(analyses[0]!.reasons.map((r) => r.label)).toEqual([label]);
+  });
+
+  it.each([
+    ['片方の枝が b を見ない', 'b.x = 1 OR a.y = 2'],
+    ['片方の枝が IS NULL', 'b.x IS NULL OR b.x = 1'],
+    ['NOT (A AND B) の片方が b を見ない', 'NOT (b.x = 1 AND a.y = 2)'],
+  ])('根拠にしない: %s', (_name, where) => {
+    expect(analyze(where)).toEqual([]);
+  });
+});

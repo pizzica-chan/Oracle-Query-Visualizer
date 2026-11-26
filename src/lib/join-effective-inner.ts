@@ -400,34 +400,50 @@ interface NullRejectingLeaf {
   negated: boolean;
 }
 
+/** 条件木を、理由の文に書く SQL の形にする（AND / OR の入れ子は括弧で囲む） */
+function conditionText(node: ConditionNode): string {
+  if (node.type === 'not') return `NOT (${(node.children ?? []).map(conditionText).join(' AND ')})`;
+  if (node.type === 'and' || node.type === 'or') {
+    const joiner = node.type === 'and' ? ' AND ' : ' OR ';
+    return (node.children ?? [])
+      .map((child) => (child.type === 'and' || child.type === 'or' ? `(${conditionText(child)})` : conditionText(child)))
+      .join(joiner);
+  }
+  return node.label;
+}
+
 /**
  * 条件木から「未結合行では決して真にならない」葉を集める。
- * OR の枝は、もう一方の枝が真なら行が残るので根拠にしない。
+ * AND は、どれか 1 つの枝が真にならなければ全体も真にならない。
+ * OR は、すべての枝が真にならないときだけ全体も真にならない（`b.x = 1 OR b.z = 2` は b の無い行で両方とも
+ * 真にならない）。そのときは OR 全体を 1 つの葉として返す。1 つでも真になりうる枝があれば根拠にしない。
  * NOT の内側では AND と OR が入れ替わる（`NOT (A AND B)` は `NOT A OR NOT B`）。
  */
 function collectNullRejectingLeaves(
   node: ConditionNode | undefined,
   identifiers: string[],
   joinDerivedIds: Set<string>,
-  underOr = false,
   negated = false,
 ): NullRejectingLeaf[] {
   if (!node) return [];
 
   if (node.type === 'not') {
     return (node.children ?? []).flatMap((child) =>
-      collectNullRejectingLeaves(child, identifiers, joinDerivedIds, underOr, !negated),
+      collectNullRejectingLeaves(child, identifiers, joinDerivedIds, !negated),
     );
   }
 
   if (node.type === 'and' || node.type === 'or') {
     const actsAsOr = (node.type === 'or') !== negated;
-    return (node.children ?? []).flatMap((child) =>
-      collectNullRejectingLeaves(child, identifiers, joinDerivedIds, underOr || actsAsOr, negated),
+    const perChild = (node.children ?? []).map((child) =>
+      collectNullRejectingLeaves(child, identifiers, joinDerivedIds, negated),
     );
+    if (!actsAsOr) return perChild.flat();
+    if (perChild.length === 0 || perChild.some((leaves) => leaves.length === 0)) return [];
+    return [{ node: { ...node, label: conditionText(node) }, negated }];
   }
 
-  if (underOr || !isNullRejectingLeaf(node, identifiers, negated, joinDerivedIds)) return [];
+  if (!isNullRejectingLeaf(node, identifiers, negated, joinDerivedIds)) return [];
   return [{ node, negated }];
 }
 
