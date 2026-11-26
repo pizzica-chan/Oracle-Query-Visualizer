@@ -370,6 +370,8 @@ function deleteTargetTables(query: ParsedQuery): TableRef[] {
       tables.push(table);
     }
   }
+  // `DELETE FROM (SELECT …) WHERE …` の対象のインラインビューは名前を持たないので、名前で探せない。テーブルが 1 つならそれが対象
+  if (tables.length === 0 && query.tables.length === 1) return [query.tables[0]!];
   return tables;
 }
 

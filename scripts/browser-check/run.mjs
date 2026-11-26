@@ -229,6 +229,19 @@ async function shareChecks(b) {
   check('リロードすると自分の SQL に戻る', (await b.eval(`${textarea()}.value`)) === 'SELECT mine FROM t');
 }
 
+async function joinSpanChecks(b) {
+  // テーブルや結合の形が変わらない編集では JOIN 図の配置を作り直さない。そのあいだもノードが指す SQL の範囲は新しくする
+  await replaceText(b, 'SELECT mine FROM t');
+  await b.key('Enter', { keyCode: 13, modifiers: 2 });
+  await clickTab(b, 'JOIN');
+  await replaceText(b, 'SELECT shared, edited FROM t');
+  await b.key('Enter', { keyCode: 13, modifiers: 2 });
+  await sleep(500);
+  const span = await b.eval(`(() => { const n = document.querySelector('.tab-pane:not(.tab-pane--hidden) .table-node[data-span-start]'); return n ? [Number(n.dataset.spanStart), Number(n.dataset.spanEnd)] : null; })()`);
+  const sql = 'SELECT shared, edited FROM t';
+  check('SQL を編集したあとも、JOIN 図のノードは新しい SQL のテーブルの位置を指す', span !== null && sql.slice(span[0], span[1]) === 't', JSON.stringify(span));
+}
+
 async function layoutChecks(b) {
   await b.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 800, deviceScaleFactor: 1, mobile: true });
   await sleep(500);
@@ -246,6 +259,7 @@ try {
   await editorChecks(b);
   await samplesAndThemeChecks(b);
   await shareChecks(b);
+  await joinSpanChecks(b);
   await layoutChecks(b);
   check('操作の全体を通して例外とコンソールのエラーが出ない', b.errors().length === 0, b.errors().slice(0, 5).join(' | '));
 } catch (error) {

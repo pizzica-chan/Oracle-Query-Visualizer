@@ -22,6 +22,12 @@ interface ProcessedAnchor {
   processedPos: number;
 }
 
+/** CAST の型名を MySQL の型名に書き換えた所。processedPos は書き換えた範囲の始まり（AS の直後） */
+export interface CastTypeInfo extends ProcessedAnchor {
+  /** 元の SQL の型の書き方（`NUMBER(10, 2)` など） */
+  originalType: string;
+}
+
 /** 旧式外部結合演算子 `(+)` */
 export interface OuterJoinMarker extends ProcessedAnchor {
   /** 元 SQL 上の `(+)` の範囲 */
@@ -74,6 +80,8 @@ export interface PreprocessResult {
   rowLimits: RowLimitInfo[];
   hints: OptimizerHintInfo[];
   nullsOrders: NullsOrderInfo[];
+  /** CAST の型名を書き換えた位置と、元の型の書き方 */
+  castTypes: CastTypeInfo[];
   /** preprocessed[i] の文字が元 SQL のどの位置か */
   processedToOriginal: number[];
   /** 前処理で置き換えた関数名（大文字の仮の名前 → 元の名前）。表示では元の名前に戻す */
@@ -667,23 +675,56 @@ function matchRangesWithParen(masked: string, re: RegExp): Array<{ start: number
 }
 
 /** フラッシュバック句は `AS OF TIMESTAMP <式>` まで消す */
-function flashbackRanges(masked: string): Array<{ start: number; end: number }> {
+function flashbackRanges(sql: string, masked: string): Array<{ start: number; end: number }> {
   const ranges: Array<{ start: number; end: number }> = [];
   FLASHBACK_RE.lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = FLASHBACK_RE.exec(masked)) !== null) {
-    let i = skipMaskedWhitespace(masked, match.index + match[0].length);
-    if (masked[i] === '(') {
-      const end = readBalancedParenEnd(masked, i);
-      i = end ?? masked.length;
-    } else {
-      // 括弧が無いときは次の句のキーワードまで
-      while (i < masked.length && !/[\s,;)]/.test(masked[i]!)) i += 1;
-    }
-    ranges.push({ start: match.index, end: i });
-    FLASHBACK_RE.lastIndex = i;
+    const end = readFlashbackExprEnd(sql, masked, match.index + match[0].length);
+    ranges.push({ start: match.index, end });
+    FLASHBACK_RE.lastIndex = end;
   }
   return ranges;
+}
+
+const INTERVAL_TAIL_RE = /^\s*'(?:[^']|'')*'\s+[A-Za-z]+(?:\s*\(\s*\d+\s*\))?(?:\s+TO\s+[A-Za-z]+(?:\s*\(\s*\d+\s*\))?)?/i;
+
+/**
+ * `AS OF TIMESTAMP` / `AS OF SCN` の後ろの式の終わり。式は値・関数の呼び出し・括弧・INTERVAL のリテラルを
+ * 算術の演算子でつないだもの（`SYSTIMESTAMP - INTERVAL '1' HOUR`）。演算子が続かなくなった所で止め、
+ * 後ろの別名（`t`）や句のキーワードは残す
+ */
+function readFlashbackExprEnd(sql: string, masked: string, from: number): number {
+  let i = from;
+  let end = from;
+  for (;;) {
+    i = skipMaskedWhitespace(masked, i);
+    // 値の 1 つ
+    if (sql[i] === "'") {
+      i = readStringLiteralEnd(sql, i);
+    } else if (masked[i] === '(') {
+      i = readBalancedParenEnd(masked, i) ?? masked.length;
+    } else {
+      const word = /^[A-Za-z0-9_$#.]+/.exec(masked.slice(i))?.[0];
+      if (!word) return end;
+      i += word.length;
+      const upper = word.toUpperCase();
+      if (upper === 'INTERVAL') {
+        const tail = INTERVAL_TAIL_RE.exec(sql.slice(i))?.[0];
+        if (tail) i += tail.length;
+      } else if ((upper === 'TIMESTAMP' || upper === 'DATE') && sql[skipMaskedWhitespace(masked, i)] === "'") {
+        i = readStringLiteralEnd(sql, skipMaskedWhitespace(masked, i));
+      } else if (masked[skipMaskedWhitespace(masked, i)] === '(') {
+        i = readBalancedParenEnd(masked, skipMaskedWhitespace(masked, i)) ?? masked.length;
+      }
+    }
+    end = i;
+    // 演算子が続けば、次の値を読む
+    const next = skipMaskedWhitespace(masked, i);
+    const operator = /^(?:\|\||[-+*/])/.exec(masked.slice(next))?.[0];
+    if (!operator) return end;
+    i = next + operator.length;
+  }
 }
 
 /** 行ロック指定は文末までの修飾なので、まとめて消す */
@@ -733,7 +774,7 @@ function stripNonStructuralClauses(state: ProcessState): void {
     ...matchRanges(masked, ORDER_SIBLINGS_RE, 1),
     ...matchRangesWithParen(masked, TABLE_PARTITION_RE),
     ...matchRangesWithParen(masked, SAMPLE_RE),
-    ...flashbackRanges(masked),
+    ...flashbackRanges(state.sql, masked),
     ...forUpdateRanges(masked),
     ...matchRanges(masked, DB_LINK_RE),
   ]);
@@ -775,8 +816,12 @@ const ORACLE_CAST_TYPES: Array<[RegExp, string]> = [
   [/\bRAW\b/gi, 'BINARY'],
 ];
 
-/** CAST(x AS NUMBER(10,2)) の型名だけを書き換える。列名の NUMBER は触らない */
-function rewriteCastTypes(state: ProcessState): void {
+/**
+ * CAST(x AS NUMBER(10,2)) の型名だけを書き換える。列名の NUMBER は触らない。
+ * 書き換えた所と元の型の書き方を返す。表示では元の型名に戻す（DECIMAL と書いていない SQL に DECIMAL と出さない）
+ */
+function rewriteCastTypes(state: ProcessState): CastTypeInfo[] {
+  const records: CastTypeInfo[] = [];
   const masked = maskNonCode(state.sql);
   const castRe = /\bCAST\s*\(/gi;
   const regions: Array<{ start: number; end: number }> = [];
@@ -797,8 +842,14 @@ function rewriteCastTypes(state: ProcessState): void {
     for (const [pattern, replacement] of ORACLE_CAST_TYPES) {
       rewritten = rewritten.replace(pattern, replacement);
     }
-    if (rewritten !== text) spliceProcessed(state, region.start, region.end, rewritten);
+    if (rewritten === text) continue;
+    spliceProcessed(state, region.start, region.end, rewritten);
+    // 左側の書き換えで位置がずれるので、記録はすぐに補正の対象へ入れる
+    const record: CastTypeInfo = { processedPos: region.start, originalType: text.replace(/^AS\s+/i, '').trim() };
+    state.anchors.push(record);
+    records.push(record);
   }
+  return records;
 }
 
 function findAsKeywordInRegion(masked: string, start: number, end: number): number | null {
@@ -1033,6 +1084,46 @@ function quoteIdentifiersWithSpecialChars(state: ProcessState): void {
 const AGGREGATE_DISTINCT_RE =
   /(?<![\w$#.`\u0080-￿])(?:SUM|AVG|MIN|MAX|STDDEV|STDDEV_POP|STDDEV_SAMP|VARIANCE|VAR_POP|VAR_SAMP|MEDIAN)\s*\(\s*DISTINCT\b/giu;
 
+/**
+ * 集約関数の UNIQUE。Oracle では DISTINCT と同じ意味（Oracle Database 23 SQL Language Reference
+ * 「Aggregate Functions」: DISTINCT and UNIQUE, which are synonymous）だが、パーサーは読めない。
+ * DISTINCT に書き換える（表示も DISTINCT になる）
+ */
+const AGGREGATE_UNIQUE_RE =
+  /(?<![\w$#.`\u0080-￿])(?:COUNT|SUM|AVG|MIN|MAX|STDDEV|STDDEV_POP|STDDEV_SAMP|VARIANCE|VAR_POP|VAR_SAMP|MEDIAN)\s*\(\s*(UNIQUE)\b/giu;
+
+function rewriteAggregateUnique(state: ProcessState): void {
+  const masked = maskNonCode(state.sql);
+  const starts = [...masked.matchAll(AGGREGATE_UNIQUE_RE)].map((m) => m.index + m[0].length - 'UNIQUE'.length);
+  for (const start of starts.reverse()) spliceProcessed(state, start, start + 'UNIQUE'.length, 'DISTINCT');
+}
+
+/**
+ * 階層問い合わせの演算子 CONNECT_BY_ROOT と、SELECT 列などに書いた PRIOR（Oracle Database 23 SQL Language Reference
+ * 「Hierarchical Query Operators」）。パーサーは読めないので、`CONNECT_BY_ROOT(e.name)` の関数の形にして読ませ、
+ * 表示は parser.ts で元の形に戻す。CONNECT BY 句の中の PRIOR は、句ごと取り除いてあるので対象にならない
+ */
+const HIERARCHICAL_OPERATOR_RE = /(?<![\w$#.`"\u0080-￿])(?:CONNECT_BY_ROOT|PRIOR)(?=\s)/giu;
+/** 演算子の後ろの列（修飾付き、引用識別子を含む） */
+const OPERAND_COLUMN_RE = /^(?:"(?:[^"]|"")*"|[\p{L}_][\p{L}\p{N}_$#]*)(?:\s*\.\s*(?:"(?:[^"]|"")*"|[\p{L}_][\p{L}\p{N}_$#]*))*/u;
+
+function parenthesizeHierarchicalOperators(state: ProcessState): void {
+  const masked = maskNonCode(state.sql);
+  const inserts: Array<{ at: number; text: string }> = [];
+  for (const match of masked.matchAll(HIERARCHICAL_OPERATOR_RE)) {
+    const keywordEnd = match.index + match[0].length;
+    // 引用識別子は masked では空白に見えるので、元の SQL の空白だけを飛ばす
+    const operandStart = keywordEnd + (/^\s*/.exec(state.sql.slice(keywordEnd))?.[0].length ?? 0);
+    // `PRIOR (a + b)` は、そのままでも関数の呼び出しとして読める
+    if (masked[operandStart] === '(') continue;
+    const operand = OPERAND_COLUMN_RE.exec(state.sql.slice(operandStart))?.[0];
+    if (!operand) continue;
+    inserts.push({ at: keywordEnd, text: '(' }, { at: operandStart + operand.length, text: ')' });
+  }
+  inserts.sort((a, b) => b.at - a.at);
+  for (const { at, text } of inserts) spliceProcessed(state, at, at, text);
+}
+
 function parenthesizeAggregateDistinct(state: ProcessState): void {
   const masked = maskNonCode(state.sql);
   const inserts: Array<{ at: number; text: string }> = [];
@@ -1214,7 +1305,7 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
 
   stripNonStructuralClauses(state);
   stripTrailingFunctionClauses(state);
-  rewriteCastTypes(state);
+  const castTypes = rewriteCastTypes(state);
   normalizeSelectModifiers(state);
   expandMultiColumnUpdateSet(state);
   insertOmittedDeleteFrom(state);
@@ -1232,7 +1323,9 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
   ]);
 
   escapeBackslashesInStringLiterals(state);
+  rewriteAggregateUnique(state);
   parenthesizeAggregateDistinct(state);
+  parenthesizeHierarchicalOperators(state);
   const renamedFunctions = renameReservedAggregates(state);
   quoteIdentifiersWithSpecialChars(state);
 
@@ -1247,6 +1340,7 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
     rowLimits,
     hints,
     nullsOrders,
+    castTypes,
     processedToOriginal: state.processedToOriginal,
     renamedFunctions,
   };

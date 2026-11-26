@@ -57,9 +57,15 @@ describe('AND と OR の優先順位（Oracle Database 23 SQL Language Reference
     );
   });
 
-  it('旧式外部結合 (+) の結合条件を含む WHERE でも組み直す', () => {
-    expect(whereOf('SELECT a.x FROM a, b WHERE a.id = b.id(+) AND b.f = 1 OR a.g = 2')).toBe(
-      'OR(AND(a.id = b.id(+), b.f = 1), a.g = 2)',
+  it('カンマ結合の結合条件を含む WHERE でも組み直す', () => {
+    expect(whereOf('SELECT a.x FROM a, b WHERE a.id = b.id AND b.f = 1 OR a.g = 2')).toBe(
+      'OR(AND(a.id = b.id, b.f = 1), a.g = 2)',
     );
+  });
+
+  // (+) を含む条件は OR でつなげない（SQL Language Reference「Joins」）。組み直した木で OR の下に来たらエラーにする
+  it('(+) を含む条件が OR の下に来る WHERE はエラーにする', () => {
+    const result = parseOracleQuery('SELECT a.x FROM a, b WHERE a.id = b.id(+) AND b.f = 1 OR a.g = 2');
+    expect(result.success).toBe(false);
   });
 });

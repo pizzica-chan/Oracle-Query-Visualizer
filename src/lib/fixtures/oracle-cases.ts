@@ -472,6 +472,90 @@ WHERE e.active = 1`;
     },
   },
   {
+    name: 'Oracle: 階層問い合わせの単項演算子 CONNECT_BY_ROOT と、SELECT 列の PRIOR',
+    category: 'oracle',
+    sql: `SELECT LEVEL lv, CONNECT_BY_ROOT e.emp_name root, PRIOR e.emp_name boss, CONNECT_BY_ROOT "E"."Name" r2
+FROM employees e START WITH e.manager_no IS NULL CONNECT BY PRIOR e.emp_no = e.manager_no`,
+    expectSuccess: true,
+    assert: (q) => {
+      const cols = q.columns.map((c) => c.expression).join(' | ');
+      if (cols !== 'LEVEL | CONNECT_BY_ROOT e.emp_name | PRIOR e.emp_name | CONNECT_BY_ROOT E.Name') throw new Error(cols);
+      if (!q.hierarchical?.connectBy) throw new Error('hierarchical');
+    },
+  },
+  {
+    name: 'Oracle: (+) を含む条件を OR でつなぐと、外部結合の制限としてエラーにする',
+    category: 'error',
+    sql: 'SELECT a.id FROM tab_a a, tab_b b WHERE a.id = b.a_id(+) AND a.x = 1 OR a.y = 2',
+    expectSuccess: false,
+    errorContains: 'OR でつなげません',
+  },
+  {
+    name: 'Oracle: (+) を付けた列を IN で比べると、外部結合の制限としてエラーにする',
+    category: 'error',
+    sql: "SELECT a.id FROM tab_a a, tab_b b WHERE a.id = b.a_id(+) AND b.kind(+) IN ('A', 'B')",
+    expectSuccess: false,
+    errorContains: 'IN で比べられません',
+  },
+  {
+    name: 'Oracle: (+) の結合とは別に、OR の条件を括弧で囲んだ WHERE は読む',
+    category: 'oracle',
+    sql: "SELECT a.id FROM tab_a a, tab_b b WHERE a.id = b.a_id(+) AND (b.kind = 'X' OR b.kind IS NULL)",
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.joins[0]?.type !== 'LEFT JOIN') throw new Error(q.joins[0]?.type);
+    },
+  },
+  {
+    name: 'Oracle: CAST の型名は元の SQL の書き方で表示する',
+    category: 'oracle',
+    sql: 'SELECT CAST(t.v AS NUMBER(10, 2)) a, CAST(t.w AS VARCHAR2(20)) b, CAST(t.x AS DATE) c FROM t',
+    expectSuccess: true,
+    assert: (q) => {
+      const cols = q.columns.map((c) => c.expression).join(' | ');
+      if (cols !== 'CAST(t.v AS NUMBER(10, 2)) | CAST(t.w AS VARCHAR2(20)) | CAST(t.x AS DATE)') throw new Error(cols);
+    },
+  },
+  {
+    name: 'Oracle: フラッシュバックの時刻を式で書いた AS OF TIMESTAMP',
+    category: 'oracle',
+    sql: "SELECT t.id FROM emp AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '1' HOUR t, dept AS OF SCN 12345 d WHERE t.d = d.id",
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.tables.map((t) => t.alias).join(',') !== 't,d') throw new Error(q.tables.map((t) => t.alias).join(','));
+    },
+  },
+  {
+    name: 'Oracle: 集約関数の UNIQUE（DISTINCT と同じ意味）',
+    category: 'oracle',
+    sql: 'SELECT t.a, COUNT(UNIQUE t.b), SUM(UNIQUE t.c) FROM t GROUP BY t.a',
+    expectSuccess: true,
+    assert: (q) => {
+      const cols = q.columns.map((c) => c.expression).join(' | ');
+      if (cols !== 't.a | COUNT(DISTINCT t.b) | SUM(DISTINCT t.c)') throw new Error(cols);
+    },
+  },
+  {
+    name: '最初のブランチだけに掛かる行制限句を、集合演算の全体のものにしない',
+    category: 'union',
+    sql: '(SELECT x FROM t1 ORDER BY x FETCH FIRST 1 ROWS ONLY) UNION ALL (SELECT x FROM t2) ORDER BY 1',
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.limit !== undefined) throw new Error(`limit: ${q.limit}`);
+      if (q.orderBy.map((o) => o.text).join() !== '1') throw new Error(q.orderBy.map((o) => o.text).join());
+      if (q.unionBranches?.[0]?.query.limit !== '1') throw new Error('branch limit');
+    },
+  },
+  {
+    name: 'Oracle: 別名の無いインラインビューから DELETE する',
+    category: 'delete',
+    sql: 'DELETE FROM (SELECT * FROM employees WHERE dept_no = 10) WHERE sal < 1000',
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.tables[0]?.table !== '派生テーブル1') throw new Error(q.tables[0]?.table);
+    },
+  },
+  {
     name: 'Oracle: 閉じていない代替引用符はエラーにする',
     category: 'error',
     sql: "SELECT e.id FROM emp e WHERE e.note = q'[abc",

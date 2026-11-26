@@ -36,14 +36,14 @@ SQL の送信や外部 API 通信は行わず、**完全オフライン**で動�
 
 | 構文 | 扱い |
 |------|------|
-| **旧式外部結合 `(+)`** | カンマ結合 + WHERE の結合条件を JOIN 図の辺として組み立てます。`(+)` が付いた側が「行を補われる側」なので、`a.x = b.y(+)` は `a LEFT JOIN b`、`a.x(+) = b.y` は `a RIGHT JOIN b` として表示します |
+| **旧式外部結合 `(+)`** | カンマ結合 + WHERE の結合条件を JOIN 図の辺として組み立てます。`(+)` が付いた側が「行を補われる側」なので、`a.x = b.y(+)` は `a LEFT JOIN b`、`a.x(+) = b.y` は `a RIGHT JOIN b` として表示します。Oracle で書けない形（`(+)` を含む条件を OR でつなぐ、`(+)` を付けた列を IN で比べる）はエラーにします |
 | **カンマ結合（暗黙結合）** | WHERE 句の AND 連結された列同士の比較を結合条件として読み、INNER JOIN の辺にします。結合条件がなければ直積（CROSS JOIN）として表示します |
-| **階層問い合わせ** | `START WITH` / `CONNECT BY [NOCYCLE] [PRIOR]` を専用セクションで説明します |
+| **階層問い合わせ** | `START WITH` / `CONNECT BY [NOCYCLE] [PRIOR]` を専用セクションで説明します。SELECT 列の `CONNECT_BY_ROOT` と `PRIOR` も読みます |
 | **オプティマイザヒント** | `/*+ … */` を拾い、代表的なヒント（`ORDERED` / `LEADING` / `USE_NL` / `INDEX` / `PARALLEL` など）の意味を添えて表示します。**実行計画への指示であって結果集合は変わらない**ことを明示します |
 | **行制限句** | `OFFSET n ROWS FETCH FIRST/NEXT m ROWS ONLY`（`PERCENT` / `WITH TIES` を含む）を後処理として説明します |
 | **ROWNUM** | WHERE 句の `ROWNUM` 比較を行数制限条件として識別します |
 | **集合演算** | `UNION` / `UNION ALL` / `MINUS` / `INTERSECT` をブランチごとに解析します |
-| **結果集合を変えない修飾** | `PARTITION (p)` / `SAMPLE (n)` / `AS OF TIMESTAMP`（フラッシュバック）/ `FOR UPDATE [OF …] [NOWAIT]` / `table@dblink` / `ORDER SIBLINGS BY` は取り除いてから解析します |
+| **結果集合を変えない修飾** | `PARTITION (p)` / `SAMPLE (n)` / `AS OF TIMESTAMP` / `AS OF SCN`（フラッシュバック。時刻を `SYSTIMESTAMP - INTERVAL '1' HOUR` のような式で書いた形を含む）/ `FOR UPDATE [OF …] [NOWAIT]` / `table@dblink` / `ORDER SIBLINGS BY` は取り除いてから解析します |
 | **その他** | `DUAL`、`SELECT UNIQUE`、`NVL` / `DECODE` / `TO_DATE` / `EXTRACT` / `REGEXP_*` などの関数、`LISTAGG … WITHIN GROUP`、分析関数 `OVER (…)`（`PARTITION BY` / `ORDER BY` / ウィンドウ枠）、`ROLLUP` / `CUBE`、`NULLS FIRST/LAST`、代替引用符 `q'[…]'`、引用識別子 `"Name"`、`#` / `$` を含む識別子（`SERIAL#` / `V$SESSION`）、`DELETE` の `FROM` 省略形 |
 
 ### その他

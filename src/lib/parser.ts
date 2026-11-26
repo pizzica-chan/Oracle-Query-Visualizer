@@ -15,6 +15,7 @@ import {
   remapParsedQuerySpans,
   shiftParsedQuerySpans,
   trimParsedQuerySpanEnds,
+  type CastTypeInfo,
   type HierarchicalClauseInfo,
   type NullsOrderInfo,
   type OptimizerHintInfo,
@@ -55,6 +56,8 @@ let hierarchicalClauses: HierarchicalClauseInfo[] = [];
 let rowLimits: RowLimitInfo[] = [];
 let optimizerHints: OptimizerHintInfo[] = [];
 let nullsOrders: NullsOrderInfo[] = [];
+/** CAST の型名を書き換えた所（位置は前処理後 SQL 上）。表示で元の型名に戻す */
+let castTypes: CastTypeInfo[] = [];
 /** 前処理で置き換えた関数名（大文字の仮の名前 → 元の名前） */
 let renamedFunctions = new Map<string, string>();
 /**
@@ -77,6 +80,7 @@ function resetIds(): void {
   rowLimits = [];
   optimizerHints = [];
   nullsOrders = [];
+  castTypes = [];
   renamedFunctions = new Map();
   embeddedSubqueryAsts = [];
 }
@@ -253,6 +257,19 @@ function formatWindowFrame(frame: any): string {
   return exprToString(frame);
 }
 
+/**
+ * CAST の変換先として元の SQL に書いた型（`NUMBER(10, 2)`）。前処理で MySQL の型名（DECIMAL）に
+ * 書き換えてから読むので、式の直後の AS の位置で書き換えた記録を探して戻す。見つからなければ undefined
+ */
+function originalCastType(node: any): string | undefined {
+  const exprEnd = node?.expr?.loc?.end?.offset;
+  if (typeof exprEnd !== 'number') return undefined;
+  const record = castTypes.find(
+    (r) => r.processedPos >= exprEnd && /^[\s)]*AS\s*$/i.test(processedSql.slice(exprEnd, r.processedPos)),
+  );
+  return record?.originalType;
+}
+
 /** 分析関数の OVER 句。落とすと同じ関数呼び出しに見えてしまう */
 function formatOverClause(over: any): string {
   const named = over?.as_window_specification;
@@ -368,6 +385,8 @@ function exprToStringCore(node: any): string {
       const args = formatFunctionArgs(rawArgs);
       // `a > ALL (SELECT …)` や `EXISTS (SELECT …)`。サブクエリの要約は括弧付きなので、関数の括弧を重ねない
       if (/^(?:ALL|ANY|SOME|EXISTS)$/.test(fnName) && /^\(SELECT .*\)$/.test(args)) return `${fnName} ${args}`;
+      // 前処理で関数の形にした階層問い合わせの演算子は、元の `CONNECT_BY_ROOT e.name` の形に戻す
+      if (/^(?:CONNECT_BY_ROOT|PRIOR)$/.test(fnName) && rawArgs.length === 1 && !node.over) return `${fnName} ${args}`;
       return `${fnName}(${args})${formatOverClause(node.over)}`;
     }
     case 'aggr_func': {
@@ -400,7 +419,7 @@ function exprToStringCore(node: any): string {
       return `CASE${operand} ${branches.join(' ')} END`;
     }
     case 'cast': {
-      return `CAST(${exprToString(node.expr)} AS ${formatCastTarget(node.target)})`;
+      return `CAST(${exprToString(node.expr)} AS ${originalCastType(node) ?? formatCastTarget(node.target)})`;
     }
     case 'datatype':
       // 型を引数に取る関数の型。素通しすると AST の JSON が表示に出る
@@ -1534,6 +1553,19 @@ function parseSelectQuery(ast: any, rawSql: string): ParsedQuery {
   main.rawSql = rawSql;
 
   if (branches.length > 1) {
+    // 最初のブランチに付いた ORDER BY / 行制限句（`(SELECT … FETCH FIRST 1 ROWS ONLY) UNION …`）は、
+    // そのブランチだけのもの。文全体の並び順と行数は、下で最後のブランチの後ろから拾う
+    main = {
+      ...main,
+      orderBy: [],
+      limit: undefined,
+      limitSpan: undefined,
+      offset: undefined,
+      offsetSpan: undefined,
+      rowLimitPercent: undefined,
+      rowLimitWithTies: undefined,
+      rowLimitSpan: undefined,
+    };
     // Oracle では、括弧の無い最後のブランチの後ろの ORDER BY / 行制限句は集合演算の結果全体に効く。
     // パーサは最後のブランチに載せるので、文レベルへ引き上げ、そのブランチからは外す。
     // 外さないと、作用説明でそのブランチだけが「最大 3 行」のように絞られて見える。
@@ -1654,10 +1686,12 @@ function parseUpdateAstCore(ast: any, rawSql: string): ParsedQuery {
 
 function parseDeleteTargets(targets: any[], tables: TableRef[]): DeleteTarget[] {
   return toArray(targets).map((entry) => {
-    const name = entry.table ?? entry.as ?? '';
-    const matched = tables.find(
-      (t) => t.alias === name || t.table === name || t.displayName === name,
-    );
+    // `DELETE FROM (SELECT …) WHERE …` の対象はインラインビュー。名前を持たないので、派生テーブルとして探す
+    const derived = entry?.expr?.ast?.type === 'select';
+    const matched = derived
+      ? tables.find((t) => t.isDerived && (entry.as ? t.alias === entry.as : !t.alias))
+      : tables.find((t) => t.alias === (entry.table ?? entry.as) || t.table === (entry.table ?? entry.as) || t.displayName === (entry.table ?? entry.as));
+    const name = derived ? (matched?.table ?? '') : (entry.table ?? entry.as ?? '');
     const label = matched
       ? matched.alias
         ? `${matched.table} AS ${matched.alias}`
@@ -1773,6 +1807,7 @@ export function parseOracleQuery(sql: string): ParseResult {
     rowLimits = preprocessResult.rowLimits;
     optimizerHints = preprocessResult.hints;
     nullsOrders = preprocessResult.nullsOrders;
+    castTypes = preprocessResult.castTypes;
     processedSql = preprocessed;
     const ast = parser.astify(preprocessed, {
       database: 'MySQL',
@@ -1818,17 +1853,17 @@ export function parseOracleQuery(sql: string): ParseResult {
         };
       }
       const query = parseSelectQuery(first, sql);
-      return { success: true, query: remap(query) };
+      return outerJoinRestrictionResult(remap(query), sql);
     }
 
     if (first.type === 'update') {
       const query = parseUpdateAst(first, sql);
-      return { success: true, query: remap(query) };
+      return outerJoinRestrictionResult(remap(query), sql);
     }
 
     if (first.type === 'delete') {
       const query = parseDeleteAst(first, sql);
-      return { success: true, query: remap(query) };
+      return outerJoinRestrictionResult(remap(query), sql);
     }
 
     return {
@@ -1883,6 +1918,60 @@ export function parseOracleQuery(sql: string): ParseResult {
       },
     };
   }
+}
+
+const OUTER_JOIN_MARK_RE = /\(\s*\+\s*\)/;
+
+/**
+ * 旧式外部結合 (+) の制限に反する書き方をエラーにする（Oracle Database 23 SQL Language Reference「Joins」）。
+ * - (+) を含む条件は、OR でほかの条件とつなげない
+ * - (+) を付けた列を、IN で比べられない
+ * そのまま解析すると、OR の下の結合条件を結合として拾えず、「直積」と説明してしまう
+ */
+function outerJoinRestrictionResult(query: ParsedQuery, sql: string): ParseResult {
+  const masked = maskNonCode(sql);
+  const errorAt = (start: number, end: number, message: string): ParseResult => {
+    const at = lineColumnAt(sql, start);
+    return { success: false, error: { message: `${at.line} 行 ${at.column} 列の${message}`, position: start, span: { start, end } } };
+  };
+  const inMatch = /\(\s*\+\s*\)\s*(?:NOT\s+)?IN\b/i.exec(masked);
+  if (inMatch) {
+    const mark = OUTER_JOIN_MARK_RE.exec(inMatch[0])!;
+    return errorAt(inMatch.index, inMatch.index + mark[0].length, '「(+)」を付けた列は IN で比べられません。外部結合は LEFT JOIN … ON で書いてください');
+  }
+  const underOr = findOuterJoinUnderOr(query);
+  if (underOr?.sourceSpan) {
+    const inside = OUTER_JOIN_MARK_RE.exec(masked.slice(underOr.sourceSpan.start, underOr.sourceSpan.end));
+    const start = underOr.sourceSpan.start + (inside?.index ?? 0);
+    const end = inside ? start + inside[0].length : underOr.sourceSpan.end;
+    return errorAt(start, end, '「(+)」を含む条件は OR でつなげません。外部結合は LEFT JOIN … ON で書いてください');
+  }
+  return { success: true, query };
+}
+
+/**
+ * OR の下にある (+) 付きの条件。WHERE と HAVING の条件木を、派生テーブル・サブクエリ・UNION の中までたどる。
+ * 結合の条件（JoinEdge）は WHERE の条件ノードを共有するので、たどらない（OR の下かどうかが分からなくなる）
+ */
+function findOuterJoinUnderOr(query: ParsedQuery): ConditionNode | undefined {
+  const inCondition = (node: ConditionNode | undefined, underOr: boolean): ConditionNode | undefined => {
+    if (!node) return undefined;
+    if (underOr && node.outerJoinSide) return node;
+    for (const child of node.children ?? []) {
+      const hit = inCondition(child, underOr || node.type === 'or');
+      if (hit) return hit;
+    }
+    // サブクエリは別の問い合わせなので、OR の下かどうかを数え直す
+    return node.nestedQuery ? inQuery(node.nestedQuery) : undefined;
+  };
+  const inQuery = (q: ParsedQuery): ConditionNode | undefined =>
+    inCondition(q.where, false) ??
+    inCondition(q.having, false) ??
+    q.tables.map((t) => (t.derivedQuery ? inQuery(t.derivedQuery) : undefined)).find(Boolean) ??
+    q.unionBranches?.map((b) => inQuery(b.query)).find(Boolean) ??
+    q.ctes?.map((c) => inQuery(c.query)).find(Boolean) ??
+    q.embeddedSubqueries?.map(inQuery).find(Boolean);
+  return inQuery(query);
 }
 
 /** span の始まりが語（識別子・キーワード）の文字なら、終わりを語の終わりまで広げる */

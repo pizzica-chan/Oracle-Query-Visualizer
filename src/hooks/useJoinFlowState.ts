@@ -48,6 +48,26 @@ export function useJoinFlowState(
     // eslint-disable-next-line react-hooks/exhaustive-deps -- nodes/edges は layoutKey と同期した useMemo 結果
   }, [layoutKey, setFlowNodes, setFlowEdges]);
 
+  // 配置のキーが同じでも、SQL を編集すると要素の範囲（sourceSpan）などの中身は変わる。
+  // 配置（利用者がドラッグした位置を含む）は残し、中身だけを新しい解析結果に差し替える。
+  // 差し替えないと、列を足しただけの編集のあとで、ノードや線のクリックとカーソル連動が SQL の古い位置を指す
+  useEffect(() => {
+    const freshNodes = new Map(nodes.map((node) => [node.id, node]));
+    const freshEdges = new Map(edges.map((edge) => [edge.id, edge]));
+    setFlowNodes((current) =>
+      current.map((node) => {
+        const fresh = freshNodes.get(node.id);
+        return fresh && fresh.data !== node.data ? { ...node, data: fresh.data } : node;
+      }),
+    );
+    setFlowEdges((current) =>
+      current.map((edge) => {
+        const fresh = freshEdges.get(edge.id);
+        return fresh && fresh.data !== edge.data ? { ...edge, data: fresh.data } : edge;
+      }),
+    );
+  }, [nodes, edges, setFlowNodes, setFlowEdges]);
+
   const resetLayout = useCallback(() => {
     setFlowNodes(nodes);
     setFlowEdges(edges);
