@@ -159,6 +159,13 @@ function describeDistinctLineJapanese(query: ParsedQuery): string {
   return `DISTINCT — ${cols} の組み合わせが同じ行を1行にまとめる`;
 }
 
+/** WHERE に ROWNUM の条件があるか（サブクエリの中は見ない） */
+function whereHasRownum(node: ConditionNode | undefined): boolean {
+  if (!node) return false;
+  if (node.isRownum) return true;
+  return (node.children ?? []).some(whereHasRownum);
+}
+
 function describePostProcessLinesJapanese(query: ParsedQuery): EffectLine[] {
   const lines: EffectLine[] = [];
   const distinctLine = describeDistinctLineJapanese(query);
@@ -168,6 +175,14 @@ function describePostProcessLinesJapanese(query: ParsedQuery): EffectLine[] {
       text: `並び順 — ${query.orderBy.map((o) => o.text).join(', ')}`,
       sourceSpan: query.orderBy[0]?.sourceSpan,
     });
+    // 同じ SELECT の ORDER BY は、ROWNUM で絞ったあとの行を並べ替える。並べ替えた結果の上位の行になるとは限らない
+    // （Oracle Database 23 SQL Language Reference「ROWNUM Pseudocolumn」）
+    if (whereHasRownum(query.where)) {
+      lines.push({
+        text: 'ROWNUM と ORDER BY — ORDER BY は ROWNUM で絞ったあとの行を並べ替えるので、並べ替えた結果の上位の行になるとは限らない（上位の行を取るには、ORDER BY を書いたサブクエリの外で ROWNUM を使うか、FETCH FIRST を使う）',
+        sourceSpan: query.orderBy[0]?.sourceSpan,
+      });
+    }
   }
   if (query.offset) {
     lines.push({
@@ -719,22 +734,70 @@ function crossJoinPhrase(join: JoinEdge, tables: TableRef[]): string {
   return `${formatJoinDisplayType(join)} — ${left} と ${right} のすべての組み合わせ（結合条件が無いので CROSS JOIN と同じ）`;
 }
 
+/** 値の一覧（`(1, NULL)`）に NULL が書かれているか。文字列の中の NULL は数えない */
+function listContainsNullLiteral(label: string): boolean {
+  const masked = maskNonCode(label);
+  const open = masked.lastIndexOf('(');
+  return open >= 0 && /(?:^|,)\s*NULL\s*(?:,|$)/i.test(masked.slice(open + 1).replace(/\)\s*$/, ''));
+}
+
 function inConditionPhrase(node: ConditionNode): string {
   const isNotIn = node.operator === 'NOT IN' || /\bNOT\s+IN\b/i.test(node.label);
 
+  // NOT IN の相手に NULL が 1 つでもあると、比べた結果が真にならず、どの行も残らない。見落としやすいので書き添える
+  // （Oracle Database 23 SQL Language Reference「IN Condition」）
   if (node.nestedQuery) {
     const prefix = isNotIn
-      ? '別の SELECT が返した値のどれとも一致しない'
+      ? '別の SELECT が返した値のどれとも一致しない（その値に NULL が 1 つでもあると、どの行も残らない）'
       : '別の SELECT が返した値のどれかと一致';
     return `${prefix} — ${node.label}`;
   }
 
+  if (isNotIn && listContainsNullLiteral(node.label)) {
+    return `次の値のどれとも一致しない（一覧に NULL があるので、どの行も残らない） — ${node.label}`;
+  }
   const prefix = isNotIn ? '次の値のどれとも一致しない' : '次の値のどれかと一致';
   return `${prefix} — ${node.label}`;
 }
 
+/** NULL と比べる比較演算子 */
+const NULL_COMPARISON_OPERATORS = new Set(['=', '<>', '!=', '^=', '<', '>', '<=', '>=']);
+
+/**
+ * `x = NULL` のように NULL と比べる条件。結果は UNKNOWN になり、どの行でも真にならない。
+ * NULL かどうかは IS NULL / IS NOT NULL で調べる（Oracle Database 23 SQL Language Reference「Nulls」）
+ */
+function comparesWithNullLiteral(node: ConditionNode): boolean {
+  if (!NULL_COMPARISON_OPERATORS.has(node.operator ?? '')) return false;
+  return /^NULL$/i.test(node.left?.trim() ?? '') || /^NULL$/i.test(node.right?.trim() ?? '');
+}
+
+/**
+ * `ROWNUM > 1` のように、ROWNUM が正の整数より大きいかを調べる条件か。常に偽になり、どの行も残らない。
+ * ROWNUM は条件を満たして残った行に 1 から振るので、最初の行が 1 のままはじかれ続ける
+ * （Oracle Database 23 SQL Language Reference「ROWNUM Pseudocolumn」）。
+ * `ROWNUM >= 2` は整数では `ROWNUM > 1` と同じなので、これも含める
+ */
+function isAlwaysFalseRownum(node: ConditionNode): boolean {
+  const left = node.left?.trim().toUpperCase();
+  const right = node.right?.trim().toUpperCase();
+  const op = node.operator ?? '';
+  const flipped: Record<string, string> = { '<': '>', '<=': '>=' };
+  const [operator, value] =
+    left === 'ROWNUM' ? [op, right] : right === 'ROWNUM' ? [flipped[op] ?? '', left] : ['', undefined];
+  if (!value || !/^\d+$/.test(value)) return false;
+  const n = Number(value);
+  return (operator === '>' && n >= 1) || (operator === '>=' && n >= 2);
+}
+
 function conditionPhrase(node: ConditionNode, mode: QueryEffectMode): string {
   if (mode === 'sql') return node.label;
+  if (node.isRownum) {
+    if (isAlwaysFalseRownum(node)) {
+      return `どの行も満たさない（ROWNUM は残った行に 1 から振るので、正の整数より大きいという条件は常に偽になる） — ${node.label}`;
+    }
+    return `行番号（ROWNUM）で件数を絞る — ${node.label}`;
+  }
 
   switch (node.type) {
     case 'exists': {
@@ -752,6 +815,9 @@ function conditionPhrase(node: ConditionNode, mode: QueryEffectMode): string {
     default:
       // NOT LIKE は、パーサーが LIKE とは別の比較として返す
       if (/^NOT\s+LIKE$/i.test(node.operator ?? '')) return `パターンに一致しない — ${node.label}`;
+      if (comparesWithNullLiteral(node)) {
+        return `NULL と比べた結果は真にならない（NULL かどうかは IS NULL / IS NOT NULL で調べる） — ${node.label}`;
+      }
       return node.label;
   }
 }

@@ -1184,3 +1184,72 @@ describe('集合演算の結果全体に掛かる後処理', () => {
     expect(buildUnionQueryEffect(parsed.query, 'japanese')?.wholeResult).toBeNull();
   });
 });
+
+describe('NOT IN の相手の NULL', () => {
+  const leafText = (where: string): string => {
+    const parsed = parseOracleQuery(`SELECT t.id FROM t WHERE ${where}`);
+    if (!parsed.success) throw new Error(parsed.error.message);
+    const filter = buildQueryEffect(parsed.query, 'japanese').sections.find((s) => s.kind === 'filter');
+    return filter?.conditionRoot?.text ?? filter?.conditionRoot?.label ?? '';
+  };
+
+  it('サブクエリの NOT IN には、NULL があるとどの行も残らないことを書き添える', () => {
+    expect(leafText('t.id NOT IN (SELECT u.t_id FROM u)')).toContain('NULL が 1 つでもあると、どの行も残らない');
+    expect(leafText('t.id IN (SELECT u.t_id FROM u)')).not.toContain('NULL');
+  });
+
+  it('値の一覧に NULL を書いた NOT IN は、どの行も残らないと書く', () => {
+    expect(leafText('t.id NOT IN (1, NULL)')).toContain('一覧に NULL があるので、どの行も残らない');
+    expect(leafText("t.id NOT IN (1, 'NULL')")).not.toContain('どの行も残らない');
+    expect(leafText('t.id IN (1, NULL)')).not.toContain('どの行も残らない');
+  });
+});
+
+describe('NULL との比較', () => {
+  const leafText = (where: string): string => {
+    const parsed = parseOracleQuery(`SELECT t.id FROM t WHERE ${where}`);
+    if (!parsed.success) throw new Error(parsed.error.message);
+    const filter = buildQueryEffect(parsed.query, 'japanese').sections.find((s) => s.kind === 'filter');
+    return filter?.conditionRoot?.text ?? filter?.conditionRoot?.label ?? '';
+  };
+
+  it('= NULL や <> NULL は真にならないことと、IS NULL で調べることを書き添える', () => {
+    expect(leafText('t.a = NULL')).toContain('NULL と比べた結果は真にならない');
+    expect(leafText('NULL <> t.a')).toContain('IS NULL / IS NOT NULL で調べる');
+    expect(leafText('t.a IS NULL')).not.toContain('真にならない');
+    expect(leafText("t.a = 'NULL'")).not.toContain('真にならない');
+
+  });
+});
+
+describe('ROWNUM の条件', () => {
+  const effectOf = (sql: string) => {
+    const parsed = parseOracleQuery(sql);
+    if (!parsed.success) throw new Error(parsed.error.message);
+    return buildQueryEffect(parsed.query, 'japanese');
+  };
+  const filterText = (sql: string): string => {
+    const root = effectOf(sql).sections.find((s) => s.kind === 'filter')?.conditionRoot;
+    return [root?.text ?? root?.label ?? '', ...(root?.children ?? []).map((c) => c.text ?? c.label ?? '')].join(' | ');
+  };
+  const lines = (sql: string) => effectOf(sql).sections.flatMap((s) => s.lines ?? []).map((l) => l.text);
+
+  it('ROWNUM で件数を絞る条件だと書く', () => {
+    expect(filterText('SELECT e.id FROM emp e WHERE ROWNUM <= 10')).toContain('行番号（ROWNUM）で件数を絞る');
+  });
+
+  it('ROWNUM が正の整数より大きいという条件は、どの行も満たさないと書く', () => {
+    expect(filterText('SELECT e.id FROM emp e WHERE ROWNUM > 1')).toContain('どの行も満たさない');
+    expect(filterText('SELECT e.id FROM emp e WHERE 5 < ROWNUM AND e.k = 1')).toContain('どの行も満たさない');
+    expect(filterText('SELECT e.id FROM emp e WHERE ROWNUM >= 2')).toContain('どの行も満たさない');
+    expect(filterText('SELECT e.id FROM emp e WHERE ROWNUM >= 1')).not.toContain('どの行も満たさない');
+    expect(filterText('SELECT e.id FROM emp e WHERE ROWNUM > 0')).not.toContain('どの行も満たさない');
+  });
+
+  it('同じ SELECT の ORDER BY と ROWNUM では、並べ替えた結果の上位の行になるとは限らないと書く', () => {
+    expect(lines('SELECT e.id FROM emp e WHERE ROWNUM <= 10 ORDER BY e.sal DESC').some((t) => t.startsWith('ROWNUM と ORDER BY'))).toBe(true);
+    expect(lines('SELECT e.id FROM emp e WHERE e.k = 1 ORDER BY e.sal DESC').some((t) => t.startsWith('ROWNUM と ORDER BY'))).toBe(false);
+    // ORDER BY をサブクエリに入れて外で ROWNUM を使う形は、上位 N 行を取る正しい書き方
+    expect(lines('SELECT * FROM (SELECT e.id FROM emp e ORDER BY e.sal DESC) WHERE ROWNUM <= 10').some((t) => t.startsWith('ROWNUM と ORDER BY'))).toBe(false);
+  });
+});
