@@ -142,6 +142,7 @@ npm run check:browser # ビルド + 実際の Chrome で dist/ を操作して�
 - INSERT / MERGE / DDL / PL/SQL ブロックなど、SELECT / UPDATE / DELETE 以外
 - 複数文（`;` 区切りで 2 文以上）— 1 文目だけ解析して残りを黙って捨てないよう、エラーにします
 - 括弧でまとめた JOIN（`a LEFT JOIN (b JOIN c ON …) ON …`）と、集合演算の右側だけを括弧で囲む書き方（`SELECT … UNION (SELECT …)`）— SQL パーサーが一部のテーブルやブランチを読み飛ばすため、エラーにします
+- 括弧の中で集合演算をまとめる書き方（`(SELECT … MINUS SELECT …) INTERSECT SELECT …`）— SQL パーサーが読めないため、エラーにします
 - PIVOT / UNPIVOT、`GROUP BY GROUPING SETS`、MODEL 句、MATCH_RECOGNIZE、`CROSS APPLY` / `OUTER APPLY`、XMLTABLE / JSON_TABLE、FROM 句の `TABLE(…)`
 - 再帰的な WITH の `SEARCH` 句と `CYCLE` 句、UPDATE / DELETE の `RETURNING … INTO`
 - ウィンドウ枠の境界に式や INTERVAL を書く形（`RANGE BETWEEN UNBOUNDED PRECEDING AND (sal/2) PRECEDING`、`RANGE INTERVAL '7' DAY PRECEDING`）

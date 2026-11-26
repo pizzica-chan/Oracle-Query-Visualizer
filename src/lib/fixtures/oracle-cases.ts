@@ -371,6 +371,13 @@ WHERE t.total > 1000`,
     },
   },
   {
+    name: '括弧の中で集合演算をまとめる書き方は、未対応と伝える',
+    category: 'error',
+    sql: '(SELECT x FROM t1 MINUS SELECT x FROM t2) INTERSECT SELECT x FROM t3',
+    expectSuccess: false,
+    errorContains: '括弧の中で集合演算をまとめる書き方',
+  },
+  {
     name: '列を書き忘れた SELECT は、原因が分かるエラーにする',
     category: 'error',
     sql: 'SELECT FROM employees',

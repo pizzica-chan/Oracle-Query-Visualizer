@@ -2199,7 +2199,7 @@ function likelySyntaxErrorCause(
   }
   const masked = maskNonCode(sql);
   const index = masked.slice(0, errorStart + 1).search(FULL_WIDTH_SEPARATOR_RE);
-  if (index < 0) return missingSelectItemCause(sql, masked, errorStart);
+  if (index < 0) return missingSelectItemCause(sql, masked, errorStart) ?? nestedSetOperationCause(masked);
   const ch = masked[index]!;
   const at = lineColumnAt(sql, index);
   const message =
@@ -2207,6 +2207,39 @@ function likelySyntaxErrorCause(
       ? `${at.line} 行 ${at.column} 列に全角の空白があります。この解析では全角の空白を語の区切りとして読めず、前後の語とつながった名前として扱います。半角の空白にしてください`
       : `${at.line} 行 ${at.column} 列の「${ch}」は全角の文字です。SQL の記号は半角（「${String.fromCharCode(ch.charCodeAt(0) - 0xfee0)}」）で書いてください`;
   return { message, span: { start: index, end: index + 1 } };
+}
+
+const NESTED_SET_OPERATOR_RE = /\b(?:UNION|MINUS|INTERSECT|EXCEPT)\b/i;
+const SET_OPERAND_PREFIX_RE = /(?:^|\b(?:UNION|MINUS|INTERSECT|EXCEPT)(?:\s+(?:ALL|DISTINCT))?)\s*$/i;
+
+/**
+ * 集合演算の項にした括弧の中に、さらに集合演算を書いた形（`(SELECT … MINUS SELECT …) INTERSECT SELECT …`）。
+ * SQL パーサーはこの括弧を読めず、括弧の中の 2 つ目の SELECT でエラーにするので、エラーの位置だけでは原因が分からない
+ */
+function nestedSetOperationCause(masked: string): { message: string; span: SourceSpan } | null {
+  let depth = 0;
+  for (let i = 0; i < masked.length; i++) {
+    const ch = masked[i];
+    if (ch === ')') depth -= 1;
+    if (ch !== '(') continue;
+    depth += 1;
+    if (depth !== 1 || !SET_OPERAND_PREFIX_RE.test(masked.slice(0, i))) continue;
+    const end = readBalancedParenEnd(masked, i);
+    if (end == null) continue;
+    let inner = masked.slice(i + 1, end - 1);
+    if (!/^\s*(?:SELECT\b|\()/i.test(inner)) continue;
+    // 括弧の中の括弧（サブクエリなど）を除いてから、集合演算の語を探す
+    for (let previous = ''; previous !== inner; ) {
+      previous = inner;
+      inner = inner.replace(/\([^()]*\)/g, (group) => ' '.repeat(group.length));
+    }
+    if (!NESTED_SET_OPERATOR_RE.test(inner)) continue;
+    return {
+      message: '括弧の中で集合演算をまとめる書き方（(SELECT … MINUS SELECT …) INTERSECT SELECT …）には対応していません',
+      span: { start: i, end },
+    };
+  }
+  return null;
 }
 
 /**
