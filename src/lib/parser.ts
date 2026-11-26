@@ -43,6 +43,7 @@ import type {
   DeleteTarget,
   SqlFragment,
   SourceSpan,
+  TableModifier,
   TableRef,
 } from './types';
 
@@ -2008,6 +2009,11 @@ const UNSUPPORTED_SYNTAX: Array<{ pattern: RegExp; message: string }> = [
   { pattern: /\b(?:CROSS|OUTER)\s+APPLY\b/i, message: 'CROSS APPLY / OUTER APPLY は未対応です' },
   { pattern: /\bMODEL\s+(?:DIMENSION|PARTITION|MEASURES)\b/i, message: 'MODEL 句は未対応です' },
   { pattern: /\bMATCH_RECOGNIZE\s*\(/i, message: 'MATCH_RECOGNIZE は未対応です' },
+  // パーサーは「,」の後ろの項目が無いエラーにするので、余分な「,」を消すように案内してしまう
+  { pattern: /\bON\s+OVERFLOW\s+(?:TRUNCATE|ERROR)\b/i, message: 'LISTAGG の ON OVERFLOW 句は未対応です' },
+  // パーサーは ALL の位置の構文エラーにする。UNION ALL は読める
+  { pattern: /\b(?:INTERSECT|MINUS|EXCEPT)\s+ALL\b/i, message: 'INTERSECT ALL / MINUS ALL / EXCEPT ALL は未対応です' },
+  { pattern: /\bWHERE\s+CURRENT\s+OF\b/i, message: 'WHERE CURRENT OF（PL/SQL のカーソルが指す行を更新・削除する書き方）は未対応です' },
   { pattern: /\bXMLTABLE\s*\(|\bJSON_TABLE\s*\(/i, message: 'XMLTABLE / JSON_TABLE は未対応です' },
   {
     pattern: /(?:\bFROM|\bJOIN|,)\s*TABLE\s*\(/i,
@@ -2122,8 +2128,13 @@ export function parseOracleQuery(sql: string): ParseResult {
       ...preprocessResult.rowLimits.map((r) => r.sourceSpan),
       ...(preprocessResult.lockingClause ? [preprocessResult.lockingClause.sourceSpan] : []),
     ];
+    // 表の後ろの SAMPLE・PARTITION・AS OF・@dblink は、範囲を入力 sql の座標にずらしてから、直前の表に持たせる
+    const tableModifiers = preprocessResult.tableModifiers.map((m) => ({
+      ...m,
+      sourceSpan: { start: m.sourceSpan.start + leadingTrim, end: m.sourceSpan.end + leadingTrim },
+    }));
     const remap = (query: ParsedQuery) =>
-      extendParsedQuerySpansOverOuterJoinMarks(
+      attachTableModifiers(extendParsedQuerySpansOverOuterJoinMarks(
         trimParsedQuerySpanEnds(
           shiftParsedQuerySpans(
             remapParsedQuerySpansWithRemovedClauses(processedToOriginal, query, trimmed, removedClauseSpans),
@@ -2132,7 +2143,7 @@ export function parseOracleQuery(sql: string): ParseResult {
           sql,
         ),
         sql,
-      );
+      ), tableModifiers);
 
     if (first.type === 'select') {
       // `SELECT … UNION (SELECT …)` は右側のブランチがエラーにならずに AST から消えるか、別の形に化ける。
@@ -2337,6 +2348,30 @@ function queryBlocksOf(query: ParsedQuery): ParsedQuery[] {
   };
   visitQuery(query);
   return blocks;
+}
+
+/**
+ * 前処理で取り除いた表の後ろの指定（SAMPLE・PARTITION・AS OF・@dblink）を、その表に持たせる。
+ * 構文図 query_table_expression では、これらは表の名前のすぐ後ろ（別名の前）に書くので、
+ * 指定より前から始まる表のうち、いちばん近いものの指定とする。UNION の最上位の問い合わせのように、
+ * 同じ表を別のオブジェクトとして持つことがあるので、同じ位置から始まる表すべてに持たせる
+ */
+function attachTableModifiers(query: ParsedQuery, modifiers: TableModifier[]): ParsedQuery {
+  if (modifiers.length === 0) return query;
+  const tables = queryBlocksOf(query).flatMap((block) => block.tables).filter((t) => t.sourceSpan);
+  for (const modifier of modifiers) {
+    let best: number | undefined;
+    for (const table of tables) {
+      const start = table.sourceSpan!.start;
+      if (start <= modifier.sourceSpan.start && (best === undefined || start > best)) best = start;
+    }
+    if (best === undefined) continue;
+    for (const table of tables) {
+      if (table.sourceSpan!.start !== best) continue;
+      if (!table.modifiers?.includes(modifier)) table.modifiers = [...(table.modifiers ?? []), modifier];
+    }
+  }
+  return query;
 }
 
 /** 1 つの問い合わせのブロックの条件（WHERE・HAVING・JOIN の ON）。サブクエリの中は別のブロックなので含めない */

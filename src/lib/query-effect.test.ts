@@ -1289,6 +1289,50 @@ describe('ROWNUM の条件', () => {
     expect(filterText('SELECT e.id FROM emp e WHERE ROWNUM > 0')).not.toContain('どの行も満たさない');
   });
 
+  it.each(['ROWNUM = 2', 'ROWNUM < 1', 'ROWNUM <= 0', 'ROWNUM <> 1', '2 = ROWNUM', '1 > ROWNUM'])(
+    'ROWNUM が 1 のときに偽になる %s も、どの行も満たさないと書く',
+    (cond) => {
+      expect(filterText(`SELECT e.id FROM emp e WHERE ${cond}`)).toContain('どの行も満たさない');
+    },
+  );
+
+  it.each(['ROWNUM >= 1', 'ROWNUM > 0', '1 <= ROWNUM', 'ROWNUM <> 0'])('どの行でも成り立つ %s は、件数を絞らないと書く', (cond) => {
+    expect(filterText(`SELECT e.id FROM emp e WHERE ${cond}`)).toContain('件数を絞らない');
+  });
+
+  it.each([
+    ['SELECT * FROM emp SAMPLE (10)', 'emp の SAMPLE (10) — 表の全部ではなく、無作為に選んだ一部の行だけを読む'],
+    ['SELECT * FROM emp SAMPLE BLOCK (10) SEED (1) e', 'emp（e） の SAMPLE BLOCK (10) SEED (1) — 表の全部ではなく'],
+    ['SELECT * FROM emp PARTITION (p1) e JOIN dept d ON d.id = e.dept_id', 'emp（e） の PARTITION (p1) — 表のうち、指定したパーティションの行だけを読む'],
+    ["SELECT * FROM emp AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '1' HOUR e", '指定した時点（SCN か時刻）にあった行を読む'],
+    ['SELECT * FROM scott.emp@remote_db e', 'scott.emp（e） の @remote_db — データベースリンクの先のデータベースにある表を読む'],
+    ['DELETE FROM emp PARTITION (p1) WHERE sal > 100', 'emp の PARTITION (p1) — 表のうち、指定したパーティションの行だけを対象にする'],
+  ])('表の後ろの読む行を変える指定を、作用説明に書く: %s', (sql, expected) => {
+    const result = parseOracleQuery(sql);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const scope = buildQueryEffect(result.query, 'japanese').sections.find((s) => s.kind === 'scope');
+    const line = (scope?.lines ?? []).find((l) => l.text.includes(expected));
+    expect(line, (scope?.lines ?? []).map((l) => l.text).join('\n')).toBeDefined();
+    // 行をクリックすると、SQL の中の指定を選ぶ
+    const written = line!.text.split(' の ')[1]!.split(' — ')[0]!;
+    expect(sql.slice(line!.sourceSpan!.start, line!.sourceSpan!.end)).toBe(written);
+  });
+
+  it('インラインビューの中の表の SAMPLE は、その中の表に持たせる', () => {
+    const result = parseOracleQuery('SELECT * FROM (SELECT * FROM emp SAMPLE (5)) v, dept d');
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    const [v, d] = result.query.tables;
+    expect(v?.modifiers).toBeUndefined();
+    expect(d?.modifiers).toBeUndefined();
+    expect(v?.derivedQuery?.tables[0]?.modifiers?.map((m) => m.text)).toEqual(['SAMPLE (5)']);
+  });
+
+  it.each(['ROWNUM = 1', 'ROWNUM <= 10', 'ROWNUM < 3', 'ROWNUM <> 3', '10 >= ROWNUM'])('%s は件数を絞る条件と書く', (cond) => {
+    expect(filterText(`SELECT e.id FROM emp e WHERE ${cond}`)).toContain('行番号（ROWNUM）で件数を絞る');
+  });
+
   it('同じ SELECT の ORDER BY と ROWNUM では、並べ替えた結果の上位の行になるとは限らないと書く', () => {
     expect(lines('SELECT e.id FROM emp e WHERE ROWNUM <= 10 ORDER BY e.sal DESC').some((t) => t.startsWith('ROWNUM と ORDER BY'))).toBe(true);
     expect(lines('SELECT e.id FROM emp e WHERE e.k = 1 ORDER BY e.sal DESC').some((t) => t.startsWith('ROWNUM と ORDER BY'))).toBe(false);

@@ -875,6 +875,27 @@ FROM employees e START WITH e.manager_no IS NULL CONNECT BY PRIOR e.emp_no = e.m
     },
   },
   {
+    name: 'Oracle: LISTAGG の ON OVERFLOW は、余分な「,」ではなく未対応の句としてエラーにする',
+    category: 'error',
+    sql: "SELECT LISTAGG(ename, ',' ON OVERFLOW TRUNCATE) WITHIN GROUP (ORDER BY ename) FROM emp",
+    expectSuccess: false,
+    errorContains: 'ON OVERFLOW 句は未対応です',
+  },
+  {
+    name: 'Oracle: MINUS ALL は、未対応の集合演算としてエラーにする',
+    category: 'error',
+    sql: 'SELECT id FROM t1 MINUS ALL SELECT id FROM t2',
+    expectSuccess: false,
+    errorContains: 'MINUS ALL / EXCEPT ALL は未対応です',
+  },
+  {
+    name: 'Oracle: WHERE CURRENT OF は、未対応の書き方としてエラーにする',
+    category: 'error',
+    sql: 'UPDATE emp SET sal = 0 WHERE CURRENT OF c1',
+    expectSuccess: false,
+    errorContains: 'WHERE CURRENT OF',
+  },
+  {
     name: 'Oracle: (+) の結合とは別に、OR の条件を括弧で囲んだ WHERE は読む',
     category: 'oracle',
     sql: "SELECT a.id FROM tab_a a, tab_b b WHERE a.id = b.a_id(+) AND (b.kind = 'X' OR b.kind IS NULL)",

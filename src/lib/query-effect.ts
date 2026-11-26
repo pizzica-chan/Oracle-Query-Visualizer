@@ -1,4 +1,4 @@
-import type { ConditionNode, JoinEdge, ParsedQuery, SelectColumn, SetClause, SourceSpan, TableRef } from './types';
+import type { ConditionNode, JoinEdge, ParsedQuery, SelectColumn, SetClause, SourceSpan, TableModifier, TableRef } from './types';
 import { formatJoinDisplayType } from './parser';
 import { getUpdateTargetTables } from './query-utils';
 import {
@@ -859,28 +859,41 @@ function comparesWithNullLiteral(node: ConditionNode): boolean {
 }
 
 /**
- * `ROWNUM > 1` のように、ROWNUM が正の整数より大きいかを調べる条件か。常に偽になり、どの行も残らない。
- * ROWNUM は条件を満たして残った行に 1 から振るので、最初の行が 1 のままはじかれ続ける
- * （Oracle Database 23 SQL Language Reference「ROWNUM Pseudocolumn」）。
- * `ROWNUM >= 2` は整数では `ROWNUM > 1` と同じなので、これも含める
+ * ROWNUM と数値を比べる条件が、件数をどう絞るか。
+ * - never: どの行も満たさない。ROWNUM は条件を満たして残った行に 1 から振るので、最初の行は 1 になり、
+ *   1 のときに偽になる条件ではじかれると、次の行もまた 1 になってはじかれ続ける
+ *   （Oracle Database 19c SQL Language Reference「ROWNUM Pseudocolumn」: The first row fetched is assigned a
+ *   ROWNUM of 1 and makes the condition false. The second row to be fetched is now the first row and is also
+ *   assigned a ROWNUM of 1 …）。ページの例は `ROWNUM > 1` だが、`ROWNUM = 2` や `ROWNUM < 1` も同じ仕組みで偽になる
+ * - always: どの行も満たす。ROWNUM は 1 から振る番号なので、`ROWNUM >= 1` や `ROWNUM > 0` は件数を絞らない
+ * - limit: 先頭の何件かだけを残す
  */
-function isAlwaysFalseRownum(node: ConditionNode): boolean {
+function rownumComparisonKind(node: ConditionNode): 'never' | 'always' | 'limit' {
   const left = node.left?.trim().toUpperCase();
   const right = node.right?.trim().toUpperCase();
-  const op = node.operator ?? '';
-  const flipped: Record<string, string> = { '<': '>', '<=': '>=' };
+  const op = (node.operator ?? '').replace('^=', '<>').replace('!=', '<>');
+  const flipped: Record<string, string> = { '<': '>', '<=': '>=', '>': '<', '>=': '<=', '=': '=', '<>': '<>' };
   const [operator, value] =
     left === 'ROWNUM' ? [op, right] : right === 'ROWNUM' ? [flipped[op] ?? '', left] : ['', undefined];
-  if (!value || !/^\d+$/.test(value)) return false;
-  const n = Number(value);
-  return (operator === '>' && n >= 1) || (operator === '>=' && n >= 2);
+  if (!value || !/^\d+(?:\.\d+)?$/.test(value) || !(operator in flipped)) return 'limit';
+  const c = Number(value);
+  const holds = (n: number): boolean =>
+    operator === '<' ? n < c : operator === '<=' ? n <= c : operator === '>' ? n > c : operator === '>=' ? n >= c : operator === '=' ? n === c : n !== c;
+  if (!holds(1)) return 'never';
+  if (operator === '>' || operator === '>=') return 'always';
+  if (operator === '<>' && !(Number.isInteger(c) && c >= 1)) return 'always';
+  return 'limit';
 }
 
 function conditionPhrase(node: ConditionNode, mode: QueryEffectMode): string {
   if (mode === 'sql') return node.label;
   if (node.isRownum) {
-    if (isAlwaysFalseRownum(node)) {
-      return `どの行も満たさない（ROWNUM は残った行に 1 から振るので、正の整数より大きいという条件は常に偽になる） — ${node.label}`;
+    const kind = rownumComparisonKind(node);
+    if (kind === 'never') {
+      return `どの行も満たさない（ROWNUM は残った行に 1 から振るので、ROWNUM が 1 のときに偽になる条件は、次の行でも 1 のまま偽になる） — ${node.label}`;
+    }
+    if (kind === 'always') {
+      return `件数を絞らない（ROWNUM は 1 から振る番号なので、どの行も満たす） — ${node.label}`;
     }
     return `行番号（ROWNUM）で件数を絞る — ${node.label}`;
   }
@@ -1243,6 +1256,38 @@ export function describeHierarchicalLines(query: ParsedQuery): EffectLine[] {
   return lines;
 }
 
+/**
+ * 表の後ろの、読む行を変える指定の説明。文は SQL Language Reference の SELECT の意味の説明に合わせた
+ * （sample_clause・partition_extension_clause・flashback_query_clause・dblink。ページが長く、文は要約でしか確かめていない）
+ */
+function tableModifierPhrase(modifier: TableModifier, statementType: ParsedQuery['statementType']): string {
+  // UPDATE と DELETE は、行を読むのではなく、更新・削除の対象にする
+  const verb = statementType === 'SELECT' ? '読む' : '対象にする';
+  switch (modifier.kind) {
+    case 'sample':
+      return /\bSEED\b/i.test(modifier.text)
+        ? '表の全部ではなく、無作為に選んだ一部の行だけを読む（括弧の中の数は、各行が選ばれる確率の %。SEED を書くと、実行のたびに同じ行を選ぼうとする）'
+        : '表の全部ではなく、無作為に選んだ一部の行だけを読む（括弧の中の数は、各行が選ばれる確率の %。選ばれる行は実行のたびに変わる）';
+    case 'partition':
+      return `表のうち、指定したパーティションの行だけを${verb}`;
+    case 'flashback':
+      return '今のデータではなく、指定した時点（SCN か時刻）にあった行を読む';
+    case 'dblink':
+      return `データベースリンクの先のデータベースにある表を${verb}`;
+  }
+}
+
+function pushTableModifierLines(lines: EffectLine[], query: ParsedQuery): void {
+  for (const table of query.tables) {
+    for (const modifier of table.modifiers ?? []) {
+      lines.push({
+        text: `${tablePrimaryName(table)} の ${modifier.text} — ${tableModifierPhrase(modifier, query.statementType)}`,
+        sourceSpan: modifier.sourceSpan,
+      });
+    }
+  }
+}
+
 function describeScope(query: ParsedQuery, mode: QueryEffectMode): QueryEffectSection | null {
   const lines: EffectLine[] = [];
   let presenceGroups: TablePresenceGroup[] | undefined;
@@ -1299,6 +1344,7 @@ function describeScope(query: ParsedQuery, mode: QueryEffectMode): QueryEffectSe
         }
       }
     }
+    pushTableModifierLines(lines, query);
   }
 
   if (lines.length === 0 && !presenceGroups) return null;

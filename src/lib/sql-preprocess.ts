@@ -88,8 +88,17 @@ export interface LockingClauseInfo {
   sourceSpan: SourceSpan;
 }
 
+/** 表の後ろの、読む行を変える指定（`SAMPLE (10)`・`PARTITION (p1)`・`AS OF …`・`@dblink`）。sourceSpan は元 SQL の座標 */
+export interface TableModifierInfo {
+  kind: 'sample' | 'partition' | 'flashback' | 'dblink';
+  text: string;
+  sourceSpan: SourceSpan;
+}
+
 export interface PreprocessResult {
   sql: string;
+  /** 取り除いた、表の後ろの指定。parser.ts が直前の表に持たせる */
+  tableModifiers: TableModifierInfo[];
   naturalJoinStarts: number[];
   outerJoinMarkers: OuterJoinMarker[];
   hierarchicalClauses: HierarchicalClauseInfo[];
@@ -638,7 +647,8 @@ function collectNullsOrders(state: ProcessState): NullsOrderInfo[] {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// 結果集合の形を変えない Oracle 固有の修飾（取り除いてから解析する）
+// 対象テーブル・結合・条件の形を変えない Oracle 固有の修飾（取り除いてから解析する）。
+// このうち表の後ろの SAMPLE・PARTITION・AS OF・@dblink は、読む行を変えるので、書き方を記録して作用説明に出す
 // ---------------------------------------------------------------------------
 
 /** `ORDER SIBLINGS BY` の SIBLINGS。階層問い合わせ専用の並び順指定 */
@@ -791,26 +801,45 @@ function forUpdateRanges(masked: string): Array<{ start: number; end: number }> 
  * 解析結果の形（対象テーブル・結合・条件）を変えない Oracle 固有の修飾を取り除く。
  * パーサはこれらを解さないため、残すと SQL 全体が解析できなくなる
  */
-function stripNonStructuralClauses(state: ProcessState, sql: string): LockingClauseInfo | undefined {
+function stripNonStructuralClauses(
+  state: ProcessState,
+  sql: string,
+): { lockingClause?: LockingClauseInfo; tableModifiers: TableModifierInfo[] } {
   const masked = maskNonCode(state.sql);
   const forUpdate = forUpdateRanges(masked);
+  const modifierRanges: Array<{ kind: TableModifierInfo['kind']; range: { start: number; end: number } }> = [
+    ...matchRangesWithParen(masked, TABLE_PARTITION_RE).map((range) => ({ kind: 'partition' as const, range })),
+    ...sampleRanges(masked).map((range) => ({ kind: 'sample' as const, range })),
+    ...flashbackRanges(state.sql, masked).map((range) => ({ kind: 'flashback' as const, range })),
+    ...matchRanges(masked, DB_LINK_RE).map((range) => ({ kind: 'dblink' as const, range })),
+  ];
+  // 元 SQL の書き方は、空白に置き換える前に取る（置き換えたあとは位置の対応表しか残らない）
+  const written = (range: { start: number; end: number }) => {
+    const span = originalSpanForProcessedRange(state, range.start, range.end);
+    const text = sql.slice(span.start, span.end);
+    return { text: text.replace(/\s+/g, ' ').trim(), sourceSpan: { start: span.start, end: span.start + text.trimEnd().length } };
+  };
+  const tableModifiers = modifierRanges
+    .map(({ kind, range }) => ({ kind, ...written(range) }))
+    .sort((a, b) => a.sourceSpan.start - b.sourceSpan.start);
   blankRanges(state, [
     ...matchRanges(masked, ORDER_SIBLINGS_RE, 1),
-    ...matchRangesWithParen(masked, TABLE_PARTITION_RE),
-    ...matchRangesWithParen(masked, SAMPLE_RE),
-    ...flashbackRanges(state.sql, masked),
+    ...modifierRanges.map(({ range }) => range),
     ...forUpdate,
-    ...matchRanges(masked, DB_LINK_RE),
   ]);
   // 行ロックの指定は結果の行を変えないが、行をロックする作用なので、取り除く前の書き方を記録して作用説明に出す
   const last = forUpdate[forUpdate.length - 1];
-  if (!last) return undefined;
-  const span = originalSpanForProcessedRange(state, last.start, last.end);
-  const written = sql.slice(span.start, span.end);
-  return {
-    text: written.replace(/\s+/g, ' ').trim(),
-    sourceSpan: { start: span.start, end: span.start + written.trimEnd().length },
-  };
+  return { lockingClause: last ? written(last) : undefined, tableModifiers };
+}
+
+/** `SAMPLE (10)` に続く `SEED (1)` も同じ指定に含める */
+function sampleRanges(masked: string): Array<{ start: number; end: number }> {
+  return matchRangesWithParen(masked, SAMPLE_RE).map((range) => {
+    const seed = /^\s*SEED\s*\(/i.exec(masked.slice(range.end));
+    if (!seed) return range;
+    const end = readBalancedParenEnd(masked, range.end + seed[0].length - 1);
+    return end == null ? range : { start: range.start, end };
+  });
 }
 
 // RANGE の後ろが境界のキーワードか数値のときだけ置き換える。INTERVAL などの式の境界はパーサが ROWS でも読めない
@@ -1390,7 +1419,7 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
   const nullsOrders = collectNullsOrders(state);
   state.anchors.push(...nullsOrders);
 
-  const lockingClause = stripNonStructuralClauses(state, sql);
+  const { lockingClause, tableModifiers } = stripNonStructuralClauses(state, sql);
   const aggregateClauses = stripTrailingFunctionClauses(state, sql);
   state.anchors.push(...aggregateClauses);
   const rangeFrameStarts = rewriteRangeFrames(state);
@@ -1434,6 +1463,7 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
     aggregateClauses,
     rangeFrameStarts,
     lockingClause,
+    tableModifiers,
     processedToOriginal: state.processedToOriginal,
     renamedFunctions,
   };
