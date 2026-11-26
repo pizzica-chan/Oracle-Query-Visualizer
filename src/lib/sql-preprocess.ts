@@ -26,6 +26,8 @@ interface ProcessedAnchor {
 export interface CastTypeInfo extends ProcessedAnchor {
   /** 元の SQL の型の書き方（`NUMBER(10, 2)` など） */
   originalType: string;
+  /** パーサーに渡した型の書き方（`DECIMAL(10, 2)` など）。書き換えていなければ originalType と同じ */
+  rewrittenType: string;
 }
 
 /** 集約関数の後ろの WITHIN GROUP (…) / KEEP (…)。processedPos は空白に置き換えた範囲の始まり */
@@ -898,10 +900,15 @@ function rewriteCastTypes(state: ProcessState): CastTypeInfo[] {
     for (const [pattern, replacement] of ORACLE_CAST_TYPES) {
       rewritten = rewritten.replace(pattern, replacement);
     }
-    if (rewritten === text) continue;
-    spliceProcessed(state, region.start, region.end, rewritten);
+    // 書き換えない CAST も記録する。表示で型名から元の型を探すとき、DECIMAL と書いた CAST と、
+    // NUMBER を DECIMAL に書き換えた CAST を見分けるため
+    if (rewritten !== text) spliceProcessed(state, region.start, region.end, rewritten);
     // 左側の書き換えで位置がずれるので、記録はすぐに補正の対象へ入れる
-    const record: CastTypeInfo = { processedPos: region.start, originalType: text.replace(/^AS\s+/i, '').trim() };
+    const record: CastTypeInfo = {
+      processedPos: region.start,
+      originalType: text.replace(/^AS\s+/i, '').trim(),
+      rewrittenType: rewritten.replace(/^AS\s+/i, '').trim(),
+    };
     state.anchors.push(record);
     records.push(record);
   }

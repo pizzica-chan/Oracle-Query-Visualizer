@@ -385,6 +385,44 @@ WHERE t.total > 1000`,
     },
   },
   {
+    name: '括弧が重なるインラインビューも、いちばん外の括弧から別名までを範囲にする',
+    category: 'subquery',
+    sql: 'SELECT d.x FROM ((SELECT a.x FROM a) UNION ALL (SELECT b.x FROM b)) d, ((SELECT c.y FROM c)) v',
+    expectSuccess: true,
+    assert: (q) => {
+      const sql = 'SELECT d.x FROM ((SELECT a.x FROM a) UNION ALL (SELECT b.x FROM b)) d, ((SELECT c.y FROM c)) v';
+      const texts = q.tables.map((t) => (t.sourceSpan ? sql.slice(t.sourceSpan.start, t.sourceSpan.end) : null));
+      const expected = ['((SELECT a.x FROM a) UNION ALL (SELECT b.x FROM b)) d', '((SELECT c.y FROM c)) v'];
+      if (JSON.stringify(texts) !== JSON.stringify(expected)) throw new Error(JSON.stringify(texts));
+    },
+  },
+  {
+    name: '文字列・NULL・CASE 式・CAST を CAST するときも、元の型名で表示する',
+    category: 'oracle',
+    sql: "SELECT CAST('2024' AS NUMBER) a, CAST(NULL AS VARCHAR2(10)) b, CAST(CASE WHEN t.x = 1 THEN 1 END AS NUMBER(5)) c, CAST(CAST(t.v AS NUMBER) AS VARCHAR2(10)) d FROM t",
+    expectSuccess: true,
+    assert: (q) => {
+      const texts = q.columns.map((c) => c.expression);
+      const expected = [
+        "CAST('2024' AS NUMBER)",
+        'CAST(NULL AS VARCHAR2(10))',
+        'CAST(CASE WHEN t.x = 1 THEN 1 END AS NUMBER(5))',
+        'CAST(CAST(t.v AS NUMBER) AS VARCHAR2(10))',
+      ];
+      if (JSON.stringify(texts) !== JSON.stringify(expected)) throw new Error(JSON.stringify(texts));
+    },
+  },
+  {
+    name: '英字以外で始まる名前（"_x"）は、引用符で囲んで表示する',
+    category: 'oracle',
+    sql: 'SELECT t."_x", t."ok_1" FROM t',
+    expectSuccess: true,
+    assert: (q) => {
+      const texts = q.columns.map((c) => c.expression);
+      if (JSON.stringify(texts) !== JSON.stringify(['t."_x"', 't.ok_1'])) throw new Error(JSON.stringify(texts));
+    },
+  },
+  {
     name: '別名に cycle と付けたインラインビューを、CYCLE 句と取り違えない',
     category: 'update',
     sql: 'UPDATE (SELECT e.sal FROM emp e) cycle SET cycle.sal = 1',

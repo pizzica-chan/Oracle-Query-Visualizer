@@ -12,8 +12,12 @@ export function isWordChar(ch: string | undefined): boolean {
   return ch !== undefined && WORD_CHAR.test(ch);
 }
 
-/** 引用符なしで書ける名前（文字で始まり、文字・数字・`_`・`$`・`#` が続く） */
-const PLAIN_IDENTIFIER_RE = /^[\p{L}_][\p{L}\p{N}\p{M}_$#]*$/u;
+/**
+ * 引用符なしで書ける名前（文字で始まり、文字・数字・`_`・`$`・`#` が続く）。
+ * 引用符なしの名前は英字（データベースの文字セットの文字）で始める決まりなので、`_x` は引用符が要る
+ * （Oracle Database 23 SQL Language Reference「Database Object Naming Rules」）
+ */
+const PLAIN_IDENTIFIER_RE = /^\p{L}[\p{L}\p{N}\p{M}_$#]*$/u;
 
 /**
  * 画面に出す名前。引用符なしで書けない名前（空白や記号を含む `"User Name"` など）は、二重引用符で囲む。

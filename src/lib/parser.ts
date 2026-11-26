@@ -271,15 +271,26 @@ function formatWindowFrame(frame: any): string {
 
 /**
  * CAST の変換先として元の SQL に書いた型（`NUMBER(10, 2)`）。前処理で MySQL の型名（DECIMAL）に
- * 書き換えてから読むので、式の直後の AS の位置で書き換えた記録を探して戻す。見つからなければ undefined
+ * 書き換えてから読むので、式の直後の AS の位置で書き換えた記録を探して戻す。
+ * パーサーは文字列・NULL・CASE 式・CAST に位置を返さないので、CAST の中がそれらのときは位置で探せない。
+ * そのときは書き換えたあとの型名で探し、元の型名が 1 通りに決まるときだけ戻す。見つからなければ undefined
  */
 function originalCastType(node: any): string | undefined {
   const exprEnd = node?.expr?.loc?.end?.offset;
-  if (typeof exprEnd !== 'number') return undefined;
-  const record = castTypes.find(
-    (r) => r.processedPos >= exprEnd && /^[\s)]*AS\s*$/i.test(processedSql.slice(exprEnd, r.processedPos)),
-  );
-  return record?.originalType;
+  if (typeof exprEnd === 'number') {
+    const record = castTypes.find(
+      (r) => r.processedPos >= exprEnd && /^[\s)]*AS\s*$/i.test(processedSql.slice(exprEnd, r.processedPos)),
+    );
+    if (record) return record.originalType;
+  }
+  const key = (type: string) => type.replace(/\s+/g, '').toUpperCase();
+  const target = key(formatCastTarget(node?.target));
+  // 空白の違い（`NUMBER(10,2)` と `NUMBER(10, 2)`）は同じ型として数える
+  const originals = new Map<string, string>();
+  for (const r of castTypes) {
+    if (key(r.rewrittenType) === target) originals.set(key(r.originalType), r.originalType);
+  }
+  return originals.size === 1 ? [...originals.values()][0] : undefined;
 }
 
 /**
@@ -1202,9 +1213,16 @@ function fillMissingColumnSpans(columns: SelectColumn[], ast: any): SelectColumn
 function derivedTableSourceSpan(inner: SourceSpan | undefined, alias: string | undefined): SourceSpan | undefined {
   if (!inner) return undefined;
   const masked = maskedProcessedSql();
-  let open = inner.start - 1;
-  while (open >= 0 && /\s/.test(masked[open]!)) open -= 1;
-  if (masked[open] !== '(') return inner;
+  // 中の SELECT の前に続く「(」のうち、いちばん外のものがインラインビューの始まり。
+  // `((SELECT …) UNION ALL (SELECT …)) d` では、中の SELECT の範囲の前に「(」が 2 つ並ぶ
+  let open = -1;
+  for (let i = inner.start - 1; i >= 0; i--) {
+    const ch = masked[i]!;
+    if (/\s/.test(ch)) continue;
+    if (ch !== '(') break;
+    open = i;
+  }
+  if (open < 0) return inner;
   const close = readBalancedParenEnd(masked, open);
   if (close == null) return inner;
   if (!alias) return { start: open, end: close };
@@ -1219,8 +1237,11 @@ function derivedTableSourceSpan(inner: SourceSpan | undefined, alias: string | u
     pos += as[0].length;
     skipBlank();
   }
-  const name = /^(?:`[^`]*`|[^\s,()]+)/.exec(processedSql.slice(pos));
-  return { start: open, end: name ? pos + name[0].length : close };
+  const name = /^(?:`(?:[^`]|``)*`|[^\s,()]+)/.exec(processedSql.slice(pos))?.[0];
+  // 取り出した語が別名と違うとき（`… ) UNION` のように、括弧の後ろが別名でないとき）は、別名を範囲に入れない
+  const unquoted = name?.startsWith('`') ? name.slice(1, -1).replace(/``/g, '`') : name;
+  if (!name || unquoted?.toUpperCase() !== alias.toUpperCase()) return { start: open, end: close };
+  return { start: open, end: pos + name.length };
 }
 
 const PARENTHESIZED_JOIN_MESSAGE =
