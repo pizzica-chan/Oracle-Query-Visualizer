@@ -216,7 +216,7 @@ ORDER SIBLINGS BY emp_name`);
     it('引用識別子に含まれる空白を名前として保つ', () => {
       const query = parseOk('SELECT "Emp No" FROM "Employee Master"');
       expect(query.tables[0]?.table).toBe('Employee Master');
-      expect(query.columns[0]?.expression).toBe('Emp No');
+      expect(query.columns[0]?.expression).toBe('"Emp No"');
     });
   });
 

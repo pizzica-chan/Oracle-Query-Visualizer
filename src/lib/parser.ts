@@ -8,7 +8,7 @@ import { Parser } from 'node-sql-parser/build/mysql';
 import { normalizeConditionTree } from './condition-tree-normalize';
 import { NO_JOIN_CONDITION, formatJoinConditionLabel } from './join-condition';
 import { fixLogicalOperatorPrecedence } from './logical-precedence';
-import { findUnclosedLiteral, isWordChar, readBalancedParenEnd } from './sql-lex';
+import { displayIdentifier, findUnclosedLiteral, isWordChar, readBalancedParenEnd } from './sql-lex';
 import {
   maskNonCode,
   preprocessSqlForParser,
@@ -366,8 +366,8 @@ function exprToStringCore(node: any): string {
   switch (node.type) {
     case 'column_ref': {
       const parts: string[] = [];
-      if (node.table) parts.push(formatIdentifier(node.table));
-      if (node.column) parts.push(formatIdentifier(node.column));
+      if (node.table) parts.push(displayIdentifier(formatIdentifier(node.table)));
+      if (node.column) parts.push(displayIdentifier(formatIdentifier(node.column)));
       return parts.join('.') || '*';
     }
     case 'number':
@@ -2199,7 +2199,7 @@ function likelySyntaxErrorCause(
   }
   const masked = maskNonCode(sql);
   const index = masked.slice(0, errorStart + 1).search(FULL_WIDTH_SEPARATOR_RE);
-  if (index < 0) return null;
+  if (index < 0) return missingSelectItemCause(sql, masked, errorStart);
   const ch = masked[index]!;
   const at = lineColumnAt(sql, index);
   const message =
@@ -2207,6 +2207,34 @@ function likelySyntaxErrorCause(
       ? `${at.line} 行 ${at.column} 列に全角の空白があります。この解析では全角の空白を語の区切りとして読めず、前後の語とつながった名前として扱います。半角の空白にしてください`
       : `${at.line} 行 ${at.column} 列の「${ch}」は全角の文字です。SQL の記号は半角（「${String.fromCharCode(ch.charCodeAt(0) - 0xfee0)}」）で書いてください`;
   return { message, span: { start: index, end: index + 1 } };
+}
+
+/**
+ * 列を書き忘れた SELECT（`SELECT FROM t`、`SELECT a, FROM t`）。パーサーは FROM を列の名前として読み、
+ * その後ろの語でエラーにするので、エラーの位置だけでは原因が分からない
+ */
+function missingSelectItemCause(
+  sql: string,
+  masked: string,
+  errorStart: number,
+): { message: string; span: SourceSpan } | null {
+  const re = /\bSELECT(\s+(?:(?:DISTINCT|UNIQUE|ALL)\s+)?)FROM\b|,(\s*)FROM\b/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(masked)) !== null) {
+    if (match.index > errorStart) break;
+    const at = lineColumnAt(sql, match.index);
+    if (match[0].startsWith(',')) {
+      return {
+        message: `${at.line} 行 ${at.column} 列の「,」の後ろに列がありません。最後の列の後ろの「,」を消してください`,
+        span: { start: match.index, end: match.index + 1 },
+      };
+    }
+    return {
+      message: `${at.line} 行 ${at.column} 列の SELECT の後ろに、表示する列がありません。列の名前か * を書いてください`,
+      span: { start: match.index, end: match.index + 'SELECT'.length },
+    };
+  }
+  return null;
 }
 
 /**

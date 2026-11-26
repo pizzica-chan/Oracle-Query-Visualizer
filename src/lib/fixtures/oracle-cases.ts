@@ -362,6 +362,37 @@ WHERE t.total > 1000`,
     errorContains: '右側だけを括弧で囲む',
   },
   {
+    name: '列を書き忘れた SELECT は、原因が分かるエラーにする',
+    category: 'error',
+    sql: 'SELECT FROM employees',
+    expectSuccess: false,
+    errorContains: 'SELECT の後ろに、表示する列がありません',
+  },
+  {
+    name: '最後の列の後ろに残った「,」は、原因が分かるエラーにする',
+    category: 'error',
+    sql: 'SELECT e.emp_no,\n  FROM employees e',
+    expectSuccess: false,
+    errorContains: '「,」の後ろに列がありません',
+  },
+  {
+    name: '引用符なしで書けない名前は、引用符で囲んで表示する（AS User Name を別名 User に見せない）',
+    category: 'oracle',
+    sql: 'SELECT u.name AS "User Name", u."x y", "T"."Id", 売上.金額 AS 合計 FROM users u, 売上, "T" ORDER BY "User Name"',
+    expectSuccess: true,
+    assert: (q) => {
+      const texts = q.columns.map((c) => [c.expression, c.alias ?? null]);
+      const expected = [
+        ['u.name', 'User Name'],
+        ['u."x y"', null],
+        ['T.Id', null],
+        ['売上.金額', '合計'],
+      ];
+      if (JSON.stringify(texts) !== JSON.stringify(expected)) throw new Error(JSON.stringify(texts));
+      if (q.orderBy[0]?.text !== '"User Name"') throw new Error(q.orderBy[0]?.text);
+    },
+  },
+  {
     name: 'FROM 句の TABLE(…) は未対応と伝える（「(」の構文エラーにしない）',
     category: 'error',
     sql: 'SELECT e.id FROM emp e WHERE e.id IN (SELECT column_value FROM TABLE(sys.odcinumberlist(1, 2)))',

@@ -12,6 +12,18 @@ export function isWordChar(ch: string | undefined): boolean {
   return ch !== undefined && WORD_CHAR.test(ch);
 }
 
+/** 引用符なしで書ける名前（文字で始まり、文字・数字・`_`・`$`・`#` が続く） */
+const PLAIN_IDENTIFIER_RE = /^[\p{L}_][\p{L}\p{N}\p{M}_$#]*$/u;
+
+/**
+ * 画面に出す名前。引用符なしで書けない名前（空白や記号を含む `"User Name"` など）は、二重引用符で囲む。
+ * 引用符を外して出すと、`AS User Name` が別名 User に見えるなど、SQL として読めなくなる
+ */
+export function displayIdentifier(name: string): string {
+  if (name === '*' || name === '' || PLAIN_IDENTIFIER_RE.test(name)) return name;
+  return `"${name.replace(/"/g, '""')}"`;
+}
+
 export interface CodeRegion {
   start: number;
   end: number;

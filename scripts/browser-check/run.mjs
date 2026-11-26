@@ -121,7 +121,7 @@ async function editorChecks(b) {
   await b.send('Input.insertText', { text: '' });
 
   // 構文エラーと「該当箇所へ移動」
-  await replaceText(b, 'SELECT a,\nFROM t\nWHERE x = 1');
+  await replaceText(b, 'SELECT a\nFROM t )\nWHERE x = 1');
   await sleep(800);
   const error = await b.eval(`({ line: document.querySelector('.sql-line--error')?.dataset.line, mark: !!document.querySelector('.sql-hl--error') })`);
   check('構文エラーの行番号を赤くし、該当箇所に印を付ける', error.line === '2' && error.mark, JSON.stringify(error));
