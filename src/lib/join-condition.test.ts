@@ -100,3 +100,25 @@ describe('join-condition', () => {
     });
   });
 });
+
+describe('結合条件が参照する表（引用符の要る別名・日本語の名前・文字列の中）', () => {
+  const referencedTables = (sql: string) => {
+    const result = parseOracleQuery(sql);
+    if (!result.success) throw new Error(result.error.message);
+    const { tables, joins } = result.query;
+    const last = joins[joins.length - 1]!;
+    const ids = new Set<string>();
+    collectTableIdsFromJoinCondition(last, tables, ids);
+    return tables.filter((t) => ids.has(t.id)).map((t) => t.alias ?? t.table);
+  };
+
+  it('引用符で囲んで表示する別名と、日本語の名前の表を見つける', () => {
+    expect(
+      referencedTables('SELECT 1 FROM 売上 JOIN emp "E E" ON "E E".id = 売上.emp_id JOIN c ON c.a = "E E".id AND c.b = 売上.id'),
+    ).toEqual(['売上', 'E E', 'c']);
+  });
+
+  it('文字列の中の名前（x.id）は参照として数えない', () => {
+    expect(referencedTables("SELECT 1 FROM a JOIN x ON x.k = a.k JOIN c ON c.a = a.id AND c.note = 'x.id'")).toEqual(['a', 'c']);
+  });
+});

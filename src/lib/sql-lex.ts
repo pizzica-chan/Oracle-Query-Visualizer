@@ -28,6 +28,17 @@ export function displayIdentifier(name: string): string {
   return `"${name.replace(/"/g, '""')}"`;
 }
 
+/**
+ * 式の中で `name.` の形の参照を探す正規表現。引用符で囲んだ形（`"E E".`）も探す。
+ * 前の文字は、名前に使える文字でないことだけを確かめる。`\b` は ASCII の文字しか語として扱わないので、
+ * 日本語の名前（`売上.`）の前では境界にならない。schema 付きの参照（`sch.tab.`）を探せるよう、前の `.` は許す
+ */
+export function qualifiedReferencePattern(name: string, flags: string): RegExp {
+  const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const quoted = `"${escape(name.replace(/"/g, '""'))}"`;
+  return new RegExp(`(?<![\\w$#\\u0080-\\uFFFF"])(?:${escape(name)}|${quoted})\\.`, flags);
+}
+
 export interface CodeRegion {
   start: number;
   end: number;

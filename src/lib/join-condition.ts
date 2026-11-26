@@ -1,3 +1,4 @@
+import { maskLiteralsAndComments, qualifiedReferencePattern } from './sql-lex';
 import type { ConditionNode, JoinEdge, ParsedQuery, TableRef } from './types';
 
 /**
@@ -57,10 +58,6 @@ export function resolveJoinConditionExpression(join: JoinEdge): string {
   return join.layoutCondition ?? join.condition;
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function addTableIdFromLeadingQualifier(expr: string, tables: TableRef[], ids: Set<string>): void {
   const match = expr.trim().match(/^("?)([a-zA-Z_][\w$]*)\1\.(?:"?)([a-zA-Z_*][\w$]*)(?:"?)/);
   if (!match) return;
@@ -83,16 +80,16 @@ function collectTableIdsFromExpression(expr: string | undefined, tables: TableRe
 
   addTableIdFromLeadingQualifier(expr, tables, ids);
 
+  // 文字列とコメントの中（`note = 'u.x'`）は参照ではないので伏せる。引用符で囲んだ名前は残す
+  const masked = maskLiteralsAndComments(expr);
   for (const table of tables) {
     if (!table.alias) continue;
-    const re = new RegExp(`\\b${escapeRegExp(table.alias)}\\.`, 'i');
-    if (re.test(expr)) ids.add(table.id);
+    if (qualifiedReferencePattern(table.alias, 'i').test(masked)) ids.add(table.id);
   }
 
   for (const table of tables.filter((t) => !t.alias)) {
     for (const term of [table.table, table.displayName].filter(Boolean) as string[]) {
-      const re = new RegExp(`\\b${escapeRegExp(term)}\\.`, 'i');
-      if (re.test(expr)) ids.add(table.id);
+      if (qualifiedReferencePattern(term, 'i').test(masked)) ids.add(table.id);
     }
   }
 }

@@ -1,6 +1,6 @@
 import type { ConditionNode, JoinEdge, JoinType, ParsedQuery, TableRef } from './types';
 import { NO_JOIN_CONDITION, joinConditionDisplayText, resolveJoinConditionExpression } from './join-condition';
-import { maskLiteralsAndComments, readBalancedParenEnd } from './sql-lex';
+import { maskLiteralsAndComments, qualifiedReferencePattern, readBalancedParenEnd } from './sql-lex';
 
 export interface EffectiveInnerReason {
   kind: 'inner_join' | 'where' | 'having';
@@ -42,10 +42,6 @@ const NON_NULL_AGGREGATE_CALL_RE = /\b(?:count|regr_count|grouping|grouping_id|a
 
 /** 両辺のどちらかが NULL でも真偽や値が決まる演算子。葉として来ても NULL 行を除外する根拠にしない */
 const NON_NULL_PROPAGATING_OPERATORS = new Set(['||', 'OR', 'AND']);
-
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 function tableIdentifiers(table: TableRef): string[] {
   const ids = [table.alias, table.table, table.displayName].filter(Boolean) as string[];
@@ -102,20 +98,10 @@ function maskExprLiterals(expr: string): string {
   return maskLiteralsAndComments(expr);
 }
 
-/**
- * 式の中で `id.` の形の参照を探す正規表現。引用符で囲んだ形（`"E E".`）も探す。
- * 前の文字は、名前に使える文字でないことだけを確かめる。`\b` は ASCII の文字しか語として扱わないので、
- * 日本語の名前（`売上.`）の前では境界にならない。schema 付きの参照（`sch.tab.`）を探せるよう、前の `.` は許す
- */
-function qualifierPattern(id: string, flags: string): RegExp {
-  const quoted = `"${escapeRegex(id.replace(/"/g, '""'))}"`;
-  return new RegExp(`(?<![\\w$#\\u0080-\\uFFFF"])(?:${escapeRegex(id)}|${quoted})\\.`, flags);
-}
-
 function expressionReferencesTable(expr: string, identifiers: string[]): boolean {
   if (!expr) return false;
   const masked = maskExprLiterals(expr);
-  return identifiers.some((id) => qualifierPattern(id, 'i').test(masked));
+  return identifiers.some((id) => qualifiedReferencePattern(id, 'i').test(masked));
 }
 
 export function isInnerJoinType(type: JoinType): boolean {
@@ -231,7 +217,7 @@ function tableRefStartPositions(rawExpr: string, identifiers: string[]): number[
   const expr = maskExprLiterals(rawExpr);
   const positions: number[] = [];
   for (const id of identifiers) {
-    const pattern = qualifierPattern(id, 'gi');
+    const pattern = qualifiedReferencePattern(id, 'gi');
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(expr)) !== null) {
       positions.push(match.index);
