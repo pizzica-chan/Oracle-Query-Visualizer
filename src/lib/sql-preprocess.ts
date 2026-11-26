@@ -989,6 +989,8 @@ function quoteIdentifiersWithSpecialChars(state: ProcessState): void {
     const word = match[0];
     // 語の途中（`1abc` の abc など）から始まる並びは、識別子の先頭ではない
     if (isWordChar(masked[match.index - 1])) continue;
+    // バインド変数（`:名前`）の名前は引用しない。引用すると `:` と名前が離れ、構文エラーになる
+    if (masked[match.index - 1] === ':') continue;
     const hasSpecial = word.includes('#') || word.includes('$');
     const hasNonAscii = /[^\x00-\x7f]/.test(word);
     if (!hasSpecial && !hasNonAscii) continue;

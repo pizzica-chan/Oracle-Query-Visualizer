@@ -1940,7 +1940,7 @@ function likelySyntaxErrorCause(
   const at = lineColumnAt(sql, index);
   const message =
     ch === '　'
-      ? `${at.line} 行 ${at.column} 列に全角の空白があります。全角の空白は語の区切りにならず、前後の語とつながった名前として読まれます。半角の空白にしてください`
+      ? `${at.line} 行 ${at.column} 列に全角の空白があります。この解析では全角の空白を語の区切りとして読めず、前後の語とつながった名前として扱います。半角の空白にしてください`
       : `${at.line} 行 ${at.column} 列の「${ch}」は全角の文字です。SQL の記号は半角（「${String.fromCharCode(ch.charCodeAt(0) - 0xfee0)}」）で書いてください`;
   return { message, span: { start: index, end: index + 1 } };
 }

@@ -31,9 +31,10 @@ const AGGREGATE_CALL_RE =
   /\b(?:count|sum|avg|min|max|stddev|stddev_pop|stddev_samp|variance|var_pop|var_samp|median|listagg|collect|corr|covar_pop|covar_samp|regr_\w+|approx_count_distinct|any_value|grouping|grouping_id)\s*\(/i;
 
 /**
- * 値がすべて NULL のグループでも NULL を返さない集約。
+ * 値がすべて NULL のグループでも NULL を返さない集約として扱うもの。HAVING の根拠にしない。
  * COUNT と REGR_COUNT は数か 0 を返す（「Aggregate Functions」: COUNT and REGR_COUNT never return null）。
- * GROUPING と GROUPING_ID は NULL を無視しない集約として同じページに挙がっている
+ * GROUPING・GROUPING_ID・APPROX_COUNT_DISTINCT は、NULL を返すかをリファレンスで確かめていないので、
+ * 根拠にしない側に入れている
  */
 const NON_NULL_AGGREGATE_CALL_RE = /\b(?:count|regr_count|grouping|grouping_id|approx_count_distinct)\s*\(/i;
 
@@ -178,8 +179,8 @@ function innerJoinReasonLabel(join: JoinEdge, tables: TableRef[]): string {
 
 /**
  * 引数が NULL なら NULL を返す関数。ここに無い関数は、NULL を受け取っても NULL 以外を返しうるものとして扱う
- * （NVL・NVL2・COALESCE・DECODE・NULLIF・LNNVL は別の値に置き換え、REPLACE と CONCAT は NULL の引数を
- * 空文字列として扱い、利用者が作ったファンクションは何を返すか分からない）。
+ * （NVL・NVL2・COALESCE・DECODE・NULLIF・LNNVL は NULL を別の値に置き換え、REPLACE と CONCAT は引数の一部が
+ * NULL でも残りの引数から値を返し、利用者が作ったファンクションは何を返すか分からない）。
  *
  * 根拠（Oracle Database 23 SQL Language Reference）:
  * - TRIM・LENGTH・TO_NUMBER・TRANSLATE は、各関数のページに「引数が null なら null を返す」と書かれている

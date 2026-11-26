@@ -336,6 +336,12 @@ describe('パーサーが読めない書き方の前処理', () => {
     expect(sql.slice(span.start, span.end)).toBe('ユーザー u');
   });
 
+  it('日本語の名前のバインド変数は引用せずに読む', () => {
+    const result = expectParseOk('SELECT t.a FROM t WHERE t.name = :名前');
+    if (!result.success) return;
+    expect(result.query.where?.label).toBe('t.name = :名前');
+  });
+
   it('UPDATE の SET a = DEFAULT を読み、比較の右の DEFAULT は書き換えない', () => {
     const result = expectParseOk('UPDATE t SET a = DEFAULT, b = 1 WHERE id = 1');
     if (!result.success) return;
