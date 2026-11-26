@@ -362,6 +362,36 @@ WHERE t.total > 1000`,
     errorContains: '右側だけを括弧で囲む',
   },
   {
+    name: 'FROM 句の TABLE(…) は未対応と伝える（「(」の構文エラーにしない）',
+    category: 'error',
+    sql: 'SELECT e.id FROM emp e WHERE e.id IN (SELECT column_value FROM TABLE(sys.odcinumberlist(1, 2)))',
+    expectSuccess: false,
+    errorContains: 'TABLE(…)',
+  },
+  {
+    name: '再帰的な WITH の CYCLE 句は未対応と伝える',
+    category: 'error',
+    sql: `WITH r (id, p) AS (SELECT id, p FROM t WHERE p IS NULL UNION ALL SELECT t.id, t.p FROM t JOIN r ON t.p = r.id)
+CYCLE id SET is_cycle TO 'Y' DEFAULT 'N'
+SELECT * FROM r`,
+    expectSuccess: false,
+    errorContains: 'CYCLE 句',
+  },
+  {
+    name: 'ウィンドウ枠の境界の INTERVAL は未対応と伝える',
+    category: 'error',
+    sql: "SELECT SUM(e.sal) OVER (ORDER BY e.d RANGE BETWEEN INTERVAL '7' DAY PRECEDING AND CURRENT ROW) s FROM emp e",
+    expectSuccess: false,
+    errorContains: 'INTERVAL',
+  },
+  {
+    name: 'RETURNING … INTO は未対応と伝える',
+    category: 'error',
+    sql: 'DELETE FROM emp e WHERE e.id = 1 RETURNING e.name INTO :n',
+    expectSuccess: false,
+    errorContains: 'RETURNING … INTO 句',
+  },
+  {
     name: '派生テーブル・IN サブクエリ・WITH の中の集合演算も、全ブランチを持つ',
     category: 'union',
     sql: `WITH c AS (SELECT a.x FROM a UNION ALL SELECT b.x FROM b)
@@ -434,7 +464,89 @@ FROM t WHERE t.name COLLATE BINARY_CI = 'abc'`,
     assert: (q) => {
       const sql = 'SELECT t.a FROM t ORDER BY t.a   DESC, t.b\n  ASC NULLS LAST';
       const texts = q.orderBy.map((o) => sql.slice(o.sourceSpan!.start, o.sourceSpan!.end));
-      if (texts.join('|') !== 't.a   DESC|t.b\n  ASC') throw new Error(JSON.stringify(texts));
+      if (texts.join('|') !== 't.a   DESC|t.b\n  ASC NULLS LAST') throw new Error(JSON.stringify(texts));
+    },
+  },
+  {
+    name: 'ORDER BY の項目の範囲は NULLS FIRST / LAST まで含む',
+    category: 'regression',
+    sql: 'SELECT e.id FROM emp e ORDER BY e.sal DESC NULLS LAST, e.id NULLS FIRST',
+    expectSuccess: true,
+    assert: (q) => {
+      const sql = 'SELECT e.id FROM emp e ORDER BY e.sal DESC NULLS LAST, e.id NULLS FIRST';
+      const texts = q.orderBy.map((o) => sql.slice(o.sourceSpan!.start, o.sourceSpan!.end));
+      if (texts.join('|') !== 'e.sal DESC NULLS LAST|e.id NULLS FIRST') throw new Error(JSON.stringify(texts));
+    },
+  },
+  {
+    name: 'LISTAGG の WITHIN GROUP と、集約の KEEP を表示に残す',
+    category: 'oracle',
+    sql: `SELECT d.dept_no,
+       LISTAGG(e.name, ',')  WITHIN  GROUP (ORDER BY e.name DESC NULLS LAST) names,
+       MAX(e.sal) KEEP (DENSE_RANK LAST ORDER BY e.hire_date) last_sal,
+       NVL(MIN(e.sal) KEEP (DENSE_RANK FIRST ORDER BY e.hire_date), 0) first_sal
+FROM dept d JOIN emp e ON e.dept_no = d.dept_no
+GROUP BY d.dept_no`,
+    expectSuccess: true,
+    assert: (q) => {
+      const texts = q.columns.map((c) => c.expression);
+      const expected = [
+        'd.dept_no',
+        "LISTAGG(e.name, ',') WITHIN GROUP (ORDER BY e.name DESC NULLS LAST)",
+        'MAX(e.sal) KEEP (DENSE_RANK LAST ORDER BY e.hire_date)',
+        'NVL(MIN(e.sal) KEEP (DENSE_RANK FIRST ORDER BY e.hire_date), 0)',
+      ];
+      if (JSON.stringify(texts) !== JSON.stringify(expected)) throw new Error(JSON.stringify(texts));
+    },
+  },
+  {
+    name: 'ウィンドウ枠の RANGE を読み、表示でも RANGE のまま出す（ROWS と取り違えない）',
+    category: 'oracle',
+    sql: `SELECT SUM(e.sal) OVER (ORDER BY e.d RANGE BETWEEN 30 PRECEDING AND CURRENT ROW) a,
+       SUM(e.sal) OVER (ORDER BY e.d NULLS FIRST ROWS 3 PRECEDING) b,
+       COUNT(*) OVER (ORDER BY e.d RANGE UNBOUNDED PRECEDING) c
+FROM emp e
+WHERE e.range BETWEEN 1 AND 2`,
+    expectSuccess: true,
+    assert: (q) => {
+      const texts = q.columns.map((c) => c.expression);
+      const expected = [
+        'SUM(e.sal) OVER (ORDER BY e.d RANGE BETWEEN 30 PRECEDING AND CURRENT ROW)',
+        'SUM(e.sal) OVER (ORDER BY e.d NULLS FIRST ROWS 3 PRECEDING)',
+        'COUNT(*) OVER (ORDER BY e.d RANGE UNBOUNDED PRECEDING)',
+      ];
+      if (JSON.stringify(texts) !== JSON.stringify(expected)) throw new Error(JSON.stringify(texts));
+      if (q.where?.label !== 'e.range BETWEEN 1 AND 2') throw new Error(q.where?.label);
+    },
+  },
+  {
+    name: 'CASE 式・文字列・数値・NULL の列も、SQL 上の範囲を持つ（クリックとカーソルで SQL と連動する）',
+    category: 'regression',
+    sql: `WITH c AS (SELECT 1 x, 'a' y FROM dual)
+SELECT /*+ FULL(c) */ DISTINCT CASE WHEN c.x > 1 THEN 'a' END k, 'lit' AS l, -- comment, with comma
+       NULL, q'[a,b]' z, c.x
+FROM c`,
+    expectSuccess: true,
+    assert: (q) => {
+      const sql = `WITH c AS (SELECT 1 x, 'a' y FROM dual)
+SELECT /*+ FULL(c) */ DISTINCT CASE WHEN c.x > 1 THEN 'a' END k, 'lit' AS l, -- comment, with comma
+       NULL, q'[a,b]' z, c.x
+FROM c`;
+      const texts = (cols: typeof q.columns) => cols.map((c) => (c.sourceSpan ? sql.slice(c.sourceSpan.start, c.sourceSpan.end) : null));
+      const main = texts(q.columns);
+      const expected = ["CASE WHEN c.x > 1 THEN 'a' END k", "'lit' AS l", 'NULL', "q'[a,b]' z", 'c.x'];
+      if (JSON.stringify(main) !== JSON.stringify(expected)) throw new Error(JSON.stringify(main));
+      const cte = texts(q.ctes![0]!.query.columns);
+      if (JSON.stringify(cte) !== JSON.stringify(['1 x', "'a' y"])) throw new Error(JSON.stringify(cte));
+    },
+  },
+  {
+    name: 'インラインビューの名前の括弧は全角で、作用の説明と同じ書き方にする',
+    category: 'subquery',
+    sql: 'SELECT v.sal FROM (SELECT e.sal FROM emp e) v',
+    expectSuccess: true,
+    assert: (q) => {
+      if (q.tables[0]?.displayName !== 'v（派生テーブル）') throw new Error(q.tables[0]?.displayName);
     },
   },
   {

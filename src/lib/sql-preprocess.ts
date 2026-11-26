@@ -28,6 +28,12 @@ export interface CastTypeInfo extends ProcessedAnchor {
   originalType: string;
 }
 
+/** 集約関数の後ろの WITHIN GROUP (…) / KEEP (…)。processedPos は空白に置き換えた範囲の始まり */
+export interface AggregateClauseInfo extends ProcessedAnchor {
+  /** 元の SQL の書き方（連続する空白は 1 つにまとめる） */
+  text: string;
+}
+
 /** 旧式外部結合演算子 `(+)` */
 export interface OuterJoinMarker extends ProcessedAnchor {
   /** 元 SQL 上の `(+)` の範囲 */
@@ -70,6 +76,8 @@ export interface NullsOrderInfo extends ProcessedAnchor {
   /** 'FIRST' | 'LAST' */
   position: 'FIRST' | 'LAST';
   sourceSpan: SourceSpan;
+  /** 空白に置き換えた NULLS FIRST / LAST の長さ。ORDER BY の項目の範囲をここまで延ばす */
+  processedLength: number;
 }
 
 export interface PreprocessResult {
@@ -82,6 +90,10 @@ export interface PreprocessResult {
   nullsOrders: NullsOrderInfo[];
   /** CAST の型名を書き換えた位置と、元の型の書き方 */
   castTypes: CastTypeInfo[];
+  /** 取り除いた WITHIN GROUP (…) / KEEP (…) の位置と、元の書き方。表示では関数の後ろに戻す */
+  aggregateClauses: AggregateClauseInfo[];
+  /** ウィンドウ枠の RANGE を ROWS に置き換えた位置（前処理後 SQL 上）。表示では RANGE に戻す */
+  rangeFrameStarts: number[];
   /** preprocessed[i] の文字が元 SQL のどの位置か */
   processedToOriginal: number[];
   /** 前処理で置き換えた関数名（大文字の仮の名前 → 元の名前）。表示では元の名前に戻す */
@@ -600,6 +612,7 @@ function collectNullsOrders(state: ProcessState): NullsOrderInfo[] {
         processedPos: start,
         position: match[1]!.toUpperCase() as 'FIRST' | 'LAST',
         sourceSpan: originalSpanForProcessedRange(state, start, end),
+        processedLength: end - start,
       },
       processedEnd: end,
     });
@@ -780,10 +793,47 @@ function stripNonStructuralClauses(state: ProcessState): void {
   ]);
 }
 
+// RANGE の後ろが境界のキーワードか数値のときだけ置き換える。INTERVAL などの式の境界はパーサが ROWS でも読めない
+const RANGE_FRAME_RE = /\bRANGE(?=\s+(?:BETWEEN\b|UNBOUNDED\b|CURRENT\s+ROW\b|\d))/gi;
+
+/**
+ * ウィンドウ枠の RANGE を、同じ長さの `ROWS ` に置き換える。パーサは ROWS の枠しか読めない。
+ * 置き換えた位置を返す。表示では RANGE に戻す（ROWS と RANGE は数える単位が違い、集計の結果が変わる）
+ */
+function rewriteRangeFrames(state: ProcessState): number[] {
+  const starts: number[] = [];
+  const masked = maskNonCode(state.sql);
+  // OVER (…) の中だけを見る。外の `WHERE e.range BETWEEN 1 AND 2` の列名を書き換えない
+  const overRe = /\bOVER\s*\(/gi;
+  let over: RegExpExecArray | null;
+  while ((over = overRe.exec(masked)) !== null) {
+    const open = over.index + over[0].length - 1;
+    const close = readBalancedParenEnd(masked, open);
+    if (close == null) continue;
+    const inside = masked.slice(open, close);
+    RANGE_FRAME_RE.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = RANGE_FRAME_RE.exec(inside)) !== null) {
+      if (/[.\w$#]/.test(inside[match.index - 1] ?? '')) continue;
+      starts.push(open + match.index);
+    }
+    overRe.lastIndex = close;
+  }
+  for (const start of starts) {
+    state.sql = `${state.sql.slice(0, start)}ROWS ${state.sql.slice(start + 5)}`;
+  }
+  return starts;
+}
+
 const WITHIN_GROUP_RE = /\bWITHIN\s+GROUP\s*\(/gi;
 const KEEP_RE = /\bKEEP\s*\(/gi;
 
-function stripTrailingFunctionClauses(state: ProcessState): void {
+/**
+ * 集約関数の後ろの WITHIN GROUP (…) / KEEP (…) を取り除く。パーサはこれらを解さない。
+ * 取り除いた所と元の書き方を返す。表示では関数の後ろに戻す（LISTAGG の並び順や KEEP の選び方が画面から消えないように）
+ */
+function stripTrailingFunctionClauses(state: ProcessState, sql: string): AggregateClauseInfo[] {
+  const records: AggregateClauseInfo[] = [];
   for (const re of [WITHIN_GROUP_RE, KEEP_RE]) {
     const masked = maskNonCode(state.sql);
     const ranges: Array<{ start: number; end: number }> = [];
@@ -796,8 +846,14 @@ function stripTrailingFunctionClauses(state: ProcessState): void {
       ranges.push({ start: match.index, end });
       re.lastIndex = end;
     }
+    for (const range of ranges) {
+      // 元の SQL から取る。前処理の途中の SQL では、中の NULLS FIRST / LAST などが空白になっている
+      const original = originalSpanForProcessedRange(state, range.start, range.end);
+      records.push({ processedPos: range.start, text: sql.slice(original.start, original.end).replace(/\s+/g, ' ') });
+    }
     for (const range of ranges.reverse()) blankOut(state, range.start, range.end);
   }
+  return records;
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,7 +1360,10 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
   state.anchors.push(...nullsOrders);
 
   stripNonStructuralClauses(state);
-  stripTrailingFunctionClauses(state);
+  const aggregateClauses = stripTrailingFunctionClauses(state, sql);
+  state.anchors.push(...aggregateClauses);
+  const rangeFrameStarts = rewriteRangeFrames(state);
+  state.offsetLists.push(rangeFrameStarts);
   const castTypes = rewriteCastTypes(state);
   normalizeSelectModifiers(state);
   expandMultiColumnUpdateSet(state);
@@ -1341,6 +1400,8 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
     hints,
     nullsOrders,
     castTypes,
+    aggregateClauses,
+    rangeFrameStarts,
     processedToOriginal: state.processedToOriginal,
     renamedFunctions,
   };

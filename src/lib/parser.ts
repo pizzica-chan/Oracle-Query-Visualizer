@@ -15,6 +15,7 @@ import {
   remapParsedQuerySpans,
   shiftParsedQuerySpans,
   trimParsedQuerySpanEnds,
+  type AggregateClauseInfo,
   type CastTypeInfo,
   type HierarchicalClauseInfo,
   type NullsOrderInfo,
@@ -58,6 +59,10 @@ let optimizerHints: OptimizerHintInfo[] = [];
 let nullsOrders: NullsOrderInfo[] = [];
 /** CAST の型名を書き換えた所（位置は前処理後 SQL 上）。表示で元の型名に戻す */
 let castTypes: CastTypeInfo[] = [];
+/** 取り除いた WITHIN GROUP (…) / KEEP (…)（位置は前処理後 SQL 上）。表示で関数の後ろに戻す */
+let aggregateClauses: AggregateClauseInfo[] = [];
+/** ウィンドウ枠の RANGE を ROWS に置き換えた位置（前処理後 SQL 上）。表示で RANGE に戻す */
+let rangeFrameStarts: number[] = [];
 /** 前処理で置き換えた関数名（大文字の仮の名前 → 元の名前） */
 let renamedFunctions = new Map<string, string>();
 /**
@@ -65,6 +70,9 @@ let renamedFunctions = new Map<string, string>();
  * （collectEmbeddedSubqueries がクエリごとに差し替える）
  */
 let embeddedSubqueryAsts: any[] = [];
+/** maskedProcessedSql() の結果と、その元にした processedSql */
+let maskedProcessed = '';
+let maskedProcessedFor = '';
 
 function nextId(prefix: string): string {
   nodeCounter += 1;
@@ -81,8 +89,12 @@ function resetIds(): void {
   optimizerHints = [];
   nullsOrders = [];
   castTypes = [];
+  aggregateClauses = [];
+  rangeFrameStarts = [];
   renamedFunctions = new Map();
   embeddedSubqueryAsts = [];
+  maskedProcessed = '';
+  maskedProcessedFor = '';
 }
 
 function noteEmbeddedSubquery(ast: any): void {
@@ -270,8 +282,41 @@ function originalCastType(node: any): string | undefined {
   return record?.originalType;
 }
 
+/**
+ * 関数の呼び出しの直後にあった WITHIN GROUP (…) / KEEP (…)（前の空白を含む）。無ければ空文字。
+ * 前処理で空白に置き換えてから読むので、呼び出しの閉じ括弧の直後で記録を探す。
+ * 引数の中の関数の記録と取り違えないよう、関数の始まりからの括弧が閉じきった位置のものだけを使う
+ */
+function trailingAggregateClause(node: any): string {
+  const start = node?.loc?.start?.offset;
+  const end = node?.loc?.end?.offset;
+  if (typeof start !== 'number' || typeof end !== 'number' || aggregateClauses.length === 0) return '';
+  const record = aggregateClauses.find((r) => {
+    if (r.processedPos <= start || r.processedPos > end) return false;
+    const before = maskNonCode(processedSql.slice(start, r.processedPos)).trimEnd();
+    if (!before.endsWith(')')) return false;
+    let depth = 0;
+    for (const ch of before) {
+      if (ch === '(') depth += 1;
+      else if (ch === ')') depth -= 1;
+    }
+    return depth === 0;
+  });
+  return record ? ` ${record.text}` : '';
+}
+
 /** 分析関数の OVER 句。落とすと同じ関数呼び出しに見えてしまう */
-function formatOverClause(over: any): string {
+/** 関数の OVER 句の枠を、前処理で RANGE から ROWS に置き換えたか */
+function hasRangeFrame(node: any): boolean {
+  const start = node?.loc?.start?.offset;
+  const end = node?.loc?.end?.offset;
+  if (typeof start !== 'number' || typeof end !== 'number') return false;
+  return rangeFrameStarts.some(
+    (pos) => pos > start && pos < end && /\bOVER\b/i.test(maskNonCode(processedSql.slice(start, pos))),
+  );
+}
+
+function formatOverClause(over: any, node?: any): string {
   const named = over?.as_window_specification;
   // `OVER w`（WINDOW 句で定義した名前の参照）は文字列で来る
   if (typeof named === 'string') return named ? ` OVER ${named}` : '';
@@ -285,13 +330,16 @@ function formatOverClause(over: any): string {
   if (partitionBy.length > 0) parts.push(`PARTITION BY ${partitionBy.join(', ')}`);
 
   const orderBy = toArray<any>(spec.orderby)
-    .map((o: any) => `${exprToString(o?.expr ?? o)}${o?.type ? ` ${o.type}` : ''}`)
+    .map((o: any) => {
+      const nulls = nullsOrderFor(o);
+      return `${exprToString(o?.expr ?? o)}${o?.type ? ` ${o.type}` : ''}${nulls ? ` NULLS ${nulls.position}` : ''}`;
+    })
     .filter((text) => text.trim().length > 0);
   if (orderBy.length > 0) parts.push(`ORDER BY ${orderBy.join(', ')}`);
 
   // 枠（ROWS BETWEEN 1 PRECEDING AND CURRENT ROW など）は集計する行の範囲を決める。落とすと別の集計に見える
-  const frame = formatWindowFrame(spec.window_frame_clause);
-  if (frame) parts.push(frame.toUpperCase());
+  const frame = formatWindowFrame(spec.window_frame_clause).toUpperCase();
+  if (frame) parts.push(hasRangeFrame(node) ? frame.replace(/^ROWS\b/, 'RANGE') : frame);
 
   return ` OVER (${parts.join(' ')})`;
 }
@@ -380,14 +428,14 @@ function exprToStringCore(node: any): string {
       // Oracle に DISTINCT という関数は無いので、この形は前処理が作ったものだけ
       const distinctArg = rawArgs.length === 1 ? rawArgs[0] : undefined;
       if (distinctArg?.type === 'function' && resolveFunctionName(distinctArg.name) === 'DISTINCT' && !distinctArg.over) {
-        return `${fnName}(DISTINCT ${formatFunctionArgs(extractFunctionArgs(distinctArg))})${formatOverClause(node.over)}`;
+        return `${fnName}(DISTINCT ${formatFunctionArgs(extractFunctionArgs(distinctArg))})${formatOverClause(node.over, node)}`;
       }
       const args = formatFunctionArgs(rawArgs);
       // `a > ALL (SELECT …)` や `EXISTS (SELECT …)`。サブクエリの要約は括弧付きなので、関数の括弧を重ねない
       if (/^(?:ALL|ANY|SOME|EXISTS)$/.test(fnName) && /^\(SELECT .*\)$/.test(args)) return `${fnName} ${args}`;
       // 前処理で関数の形にした階層問い合わせの演算子は、元の `CONNECT_BY_ROOT e.name` の形に戻す
       if (/^(?:CONNECT_BY_ROOT|PRIOR)$/.test(fnName) && rawArgs.length === 1 && !node.over) return `${fnName} ${args}`;
-      return `${fnName}(${args})${formatOverClause(node.over)}`;
+      return `${fnName}(${args})${trailingAggregateClause(node)}${formatOverClause(node.over, node)}`;
     }
     case 'aggr_func': {
       let rawArgs = node.args?.expr ?? node.args?.value ?? node.args;
@@ -405,7 +453,7 @@ function exprToStringCore(node: any): string {
       const args = toArray<any>(rawArgs)
         .map((a: any) => exprToString(a))
         .join(', ');
-      return `${node.name}(${distinctPrefix}${args})${formatOverClause(node.over)}`;
+      return `${node.name}(${distinctPrefix}${args})${trailingAggregateClause(node)}${formatOverClause(node.over, node)}`;
     }
     case 'case': {
       // ELSE は args の末尾に type:'else' の要素として入る。条件のフィールド名は cond。
@@ -649,15 +697,14 @@ function rowLimitFields(limit: RowLimitInfo | undefined): RowLimitFields {
 }
 
 /** ORDER BY エントリの直後にあった NULLS FIRST / LAST を拾う */
-function nullsOrderTextFor(entry: any): string {
+function nullsOrderFor(entry: any): NullsOrderInfo | undefined {
   const end = entry?.expr?.loc?.end?.offset;
-  if (typeof end !== 'number' || nullsOrders.length === 0) return '';
-  const found = nullsOrders.find((info) => {
+  if (typeof end !== 'number' || nullsOrders.length === 0) return undefined;
+  return nullsOrders.find((info) => {
     if (info.processedPos < end) return false;
     const between = processedSql.slice(end, info.processedPos);
     return /^[\s]*(?:ASC|DESC)?[\s]*$/i.test(between);
   });
-  return found ? ` NULLS ${found.position}` : '';
 }
 
 /** JOIN 種別の表示用文字列（NATURAL JOIN・旧式外部結合に対応） */
@@ -1074,6 +1121,79 @@ function parseColumns(columns: any[]): SelectColumn[] {
   });
 }
 
+/** 前処理後の SQL の、文字列・コメント・引用識別子を伏せたもの。列の範囲を補うときに使う */
+function maskedProcessedSql(): string {
+  if (maskedProcessedFor !== processedSql) {
+    // 前処理で引用識別子を `…` にしているので、その中も伏せる
+    maskedProcessed = maskNonCode(processedSql).replace(/`[^`]*`/g, (quoted) => ' '.repeat(quoted.length));
+    maskedProcessedFor = processedSql;
+  }
+  return maskedProcessed;
+}
+
+function keywordAt(masked: string, pos: number, keyword: string): boolean {
+  if (masked.slice(pos, pos + keyword.length).toUpperCase() !== keyword) return false;
+  return !/[\w$#.]/.test(masked[pos - 1] ?? '') && !/[\w$#]/.test(masked[pos + keyword.length] ?? '');
+}
+
+/**
+ * パーサが位置（loc）を返さない列（CASE 式・文字列や数値・NULL など）の範囲を補う。
+ * 範囲が無いと、その列をクリックしても、エディタのカーソルを置いても、SQL と連動しない。
+ * SELECT の範囲の中で、括弧の深さ 0 の SELECT から FROM までを、深さ 0 のカンマで区切る
+ * （WITH の定義やサブクエリは括弧の中にあるので数えない）。
+ * 区切った数が列の数と合わないときは補わない
+ */
+function fillMissingColumnSpans(columns: SelectColumn[], ast: any): SelectColumn[] {
+  if (columns.every((column) => column.sourceSpan)) return columns;
+  const astStart = ast?.loc?.start?.offset;
+  const astEnd = ast?.loc?.end?.offset;
+  if (typeof astStart !== 'number' || typeof astEnd !== 'number') return columns;
+  const masked = maskedProcessedSql();
+
+  let listStart: number | undefined;
+  let listEnd: number | undefined;
+  const commas: number[] = [];
+  let depth = 0;
+  for (let i = astStart; i < astEnd; i++) {
+    const ch = masked[i]!;
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    if (depth !== 0) continue;
+    if (listStart === undefined) {
+      if (keywordAt(masked, i, 'SELECT')) {
+        listStart = i + 'SELECT'.length;
+        const modifier = /^\s*(?:DISTINCT|UNIQUE|ALL)\b/i.exec(masked.slice(listStart, astEnd));
+        if (modifier) listStart += modifier[0].length;
+        i = listStart - 1;
+      }
+    } else if (ch === ',') {
+      commas.push(i);
+    } else if (keywordAt(masked, i, 'FROM')) {
+      listEnd = i;
+      break;
+    }
+  }
+  if (listStart === undefined || listEnd === undefined) return columns;
+
+  const bounds = [listStart, ...commas, listEnd];
+  if (bounds.length - 1 !== columns.length) return columns;
+  return columns.map((column, index) => {
+    if (column.sourceSpan) return column;
+    let start = index === 0 ? bounds[0]! : bounds[index]! + 1;
+    let end = bounds[index + 1]!;
+    // 文字列の中も伏せてあるので、空白かどうかは前処理後の SQL の文字で見る。
+    // 範囲の後ろのコメントは trimParsedQuerySpanEnds が除く
+    for (;;) {
+      while (start < end && /\s/.test(processedSql[start]!)) start += 1;
+      const comment = /^(?:--[^\n]*|\/\*[\s\S]*?\*\/)/.exec(processedSql.slice(start, end));
+      if (!comment) break;
+      start += comment[0].length;
+    }
+    while (end > start && /\s/.test(processedSql[end - 1]!)) end -= 1;
+    return end > start ? { ...column, sourceSpan: { start, end } } : column;
+  });
+}
+
 const PARENTHESIZED_JOIN_MESSAGE =
   '括弧でまとめた JOIN（例: a LEFT JOIN (b JOIN c ON …) ON …）には対応していません';
 
@@ -1106,7 +1226,7 @@ function buildTableRef(entry: any, index: number): TableRef {
       id: nextId('tbl'),
       table: name,
       alias: givenAlias,
-      displayName: givenAlias ? `${name} (派生テーブル)` : `${name}（別名なし）`,
+      displayName: givenAlias ? `${name}（派生テーブル）` : `${name}（別名なし）`,
       isDerived: true,
       derivedQuery: span ? { ...derivedQuery, sourceSpan: span } : derivedQuery,
       sourceSpan,
@@ -1501,7 +1621,7 @@ function buildSelectParsedCore(ast: any): ParsedQuery {
     joins: [...joins, ...derivedJoins],
     where,
     having,
-    columns: parseColumns(ast.columns),
+    columns: fillMissingColumnSpans(parseColumns(ast.columns), ast),
     groupBy,
     orderBy,
     ...rowLimitForAst(ast),
@@ -1513,10 +1633,17 @@ function buildSelectParsedCore(ast: any): ParsedQuery {
 }
 
 function parseOrderByEntries(entries: any): SqlFragment[] {
-  return toArray<any>(entries).map((o: any) => ({
-    text: `${exprToString(o.expr)}${o.type ? ` ${o.type}` : ''}${nullsOrderTextFor(o)}`,
-    sourceSpan: orderByEntrySourceSpan(o, processedSql),
-  }));
+  return toArray<any>(entries).map((o: any) => {
+    const nulls = nullsOrderFor(o);
+    const span = orderByEntrySourceSpan(o, processedSql);
+    // NULLS FIRST / LAST は前処理で空白に置き換わり、AST の範囲の外にある。項目の範囲はその終わりまで延ばす
+    const nullsEnd = nulls ? nulls.processedPos + nulls.processedLength : undefined;
+    return {
+      text: `${exprToString(o.expr)}${o.type ? ` ${o.type}` : ''}${nulls ? ` NULLS ${nulls.position}` : ''}`,
+      sourceSpan:
+        span && nullsEnd !== undefined && nullsEnd > span.end ? { start: span.start, end: nullsEnd } : span,
+    };
+  });
 }
 
 /**
@@ -1745,6 +1872,19 @@ const UNSUPPORTED_SYNTAX: Array<{ pattern: RegExp; message: string }> = [
   { pattern: /\bMODEL\s+(?:DIMENSION|PARTITION|MEASURES)\b/i, message: 'MODEL 句は未対応です' },
   { pattern: /\bMATCH_RECOGNIZE\s*\(/i, message: 'MATCH_RECOGNIZE は未対応です' },
   { pattern: /\bXMLTABLE\s*\(|\bJSON_TABLE\s*\(/i, message: 'XMLTABLE / JSON_TABLE は未対応です' },
+  {
+    pattern: /(?:\bFROM|\bJOIN|,)\s*TABLE\s*\(/i,
+    message: 'FROM 句の TABLE(…)（コレクションや関数の結果を表として読む書き方）は未対応です',
+  },
+  {
+    pattern: /\)\s*(?:SEARCH\s+(?:DEPTH|BREADTH)\s+FIRST\s+BY|CYCLE\s+[^;]*?\bSET\b)/i,
+    message: '再帰的な WITH の SEARCH 句と CYCLE 句は未対応です',
+  },
+  {
+    pattern: /\b(?:ROWS|RANGE)\s+(?:BETWEEN\s+)?INTERVAL\b|\bAND\s+INTERVAL\b[^)]*\b(?:PRECEDING|FOLLOWING)\b/i,
+    message: 'ウィンドウ枠の境界に INTERVAL を書く形（RANGE INTERVAL … PRECEDING）は未対応です',
+  },
+  { pattern: /\bRETURNING\b[^;]*\bINTO\b/i, message: 'RETURNING … INTO 句は未対応です' },
 ];
 
 /** 文の種類。SELECT / UPDATE / DELETE 以外は解析対象外として名前で返す */
@@ -1808,6 +1948,8 @@ export function parseOracleQuery(sql: string): ParseResult {
     optimizerHints = preprocessResult.hints;
     nullsOrders = preprocessResult.nullsOrders;
     castTypes = preprocessResult.castTypes;
+    aggregateClauses = preprocessResult.aggregateClauses;
+    rangeFrameStarts = preprocessResult.rangeFrameStarts;
     processedSql = preprocessed;
     const ast = parser.astify(preprocessed, {
       database: 'MySQL',

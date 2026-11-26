@@ -62,11 +62,11 @@ node-sql-parser に **Oracle 専用ビルドは無い**。全方言を実測し�
 
 - **node-sql-parser は WHERE・ON・HAVING の中で AND と OR を同じ優先順位として左から結び付ける**（`a OR b AND c` が `(a OR b) AND c` になる）。`parseOracleQuery` が `astify` の直後に `logical-precedence.ts` で組み直している。AST を自分で `astify` する経路を足すときも、この組み直しを通す。Oracle の `||` は文字列の連結なので、論理演算として扱わない（パーサーは比較より強く結び付け、連結として正しく読む）。
 
-- **`parser.ts` はモジュールレベルの可変状態を持つ**（`nodeCounter` / `naturalJoinStarts` / `outerJoinMarkers` / `hierarchicalClauses` / `rowLimits` / `optimizerHints` / `nullsOrders` / `processedSql` / `renamedFunctions` / `embeddedSubqueryAsts`）。`parseOracleQuery` の先頭の `resetIds()` で毎回全消しする前提なので、解析を並行化したり再入させたりすると壊れる。
+- **`parser.ts` はモジュールレベルの可変状態を持つ**（`nodeCounter` / `naturalJoinStarts` / `outerJoinMarkers` / `hierarchicalClauses` / `rowLimits` / `optimizerHints` / `nullsOrders` / `processedSql` / `castTypes` / `aggregateClauses` / `rangeFrameStarts` / `renamedFunctions` / `embeddedSubqueryAsts`）。`parseOracleQuery` の先頭の `resetIds()` で毎回全消しする前提なので、解析を並行化したり再入させたりすると壊れる。
 
 - **前処理で取り除いた句は空白に置き換わり、AST の `loc` 範囲の外に出る**。どの SELECT に属するかは `recordsOwnedBySelect()` が「SELECT の範囲 + 後続の空白」で判定している。`selectRange()` の空白ぶんの延長を外すと、`FETCH FIRST` や `CONNECT BY` が末尾のクエリから外れて拾われなくなる。
 
-- **長さを変えない書き換えを優先する**。`(+)` → 空白、`"Name"` → 別の引用記号、ヒントの `+` → 空白は、いずれも**同じ長さ**に置き換えているので位置対応表がずれない。長さが変わる書き換え（`q'[…]'`、`UNIQUE`→`DISTINCT`、CAST の型名、`DELETE` への `FROM` 補完、`SET a = DEFAULT` の引用、バックスラッシュの二重化、`SUM(DISTINCT a)` の括弧、`VARIANCE` の仮の名前、`#`・`$`・日本語を含む識別子の引用）は `spliceProcessed()` を通し、記録済みの位置を `adjustRecordedPositions()` で補正する。**長さの変わる書き換えを追加するなら、位置を記録する処理より後ろに置く**。
+- **長さを変えない書き換えを優先する**。`(+)` → 空白、`"Name"` → 別の引用記号、ヒントの `+` → 空白、ウィンドウ枠の `RANGE` → `ROWS `（後ろに空白 1 つ）は、いずれも**同じ長さ**に置き換えているので位置対応表がずれない。長さが変わる書き換え（`q'[…]'`、`UNIQUE`→`DISTINCT`、CAST の型名、`DELETE` への `FROM` 補完、`SET a = DEFAULT` の引用、バックスラッシュの二重化、`SUM(DISTINCT a)` の括弧、`VARIANCE` の仮の名前、`#`・`$`・日本語を含む識別子の引用）は `spliceProcessed()` を通し、記録済みの位置を `adjustRecordedPositions()` で補正する。**長さの変わる書き換えを追加するなら、位置を記録する処理より後ろに置く**。
 
 - **`(+)` の向きを取り違えない**。`(+)` が付いた側が「行を補われる（NULL で埋まる）側」。`a.x = b.y(+)` は `a LEFT JOIN b`。逆にすると図と説明が両方とも嘘になる。
 

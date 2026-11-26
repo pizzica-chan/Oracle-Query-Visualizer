@@ -434,7 +434,7 @@ WHERE a.id = b.a_id(+)
       expect(requiredGroup).toBeDefined();
       const hotLine = requiredGroup!.entries.find((e) => e.tableLabel.includes('hot'));
       expect(hotLine).toBeDefined();
-      expect(hotLine!.tableLabel).toContain('hot (派生テーブル)');
+      expect(hotLine!.tableLabel).toContain('hot（派生テーブル）');
       expect(hotLine!.tableLabel.match(/派生テーブル/g)?.length).toBe(1);
     });
 
@@ -928,7 +928,7 @@ WHERE a.id = b.a_id(+)
       ).toBe(true);
 
       const hot = required?.entries.find((e) => e.tableLabel.includes('hot'));
-      expect(hot?.tableLabel).toContain('hot (派生テーブル)');
+      expect(hot?.tableLabel).toContain('hot（派生テーブル）');
       expect(hot?.tableLabel.match(/派生テーブル/g)?.length).toBe(1);
     });
 

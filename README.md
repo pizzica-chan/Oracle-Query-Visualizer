@@ -44,7 +44,7 @@ SQL の送信や外部 API 通信は行わず、**完全オフライン**で動�
 | **ROWNUM** | WHERE 句の `ROWNUM` 比較を行数制限条件として識別します |
 | **集合演算** | `UNION` / `UNION ALL` / `MINUS` / `INTERSECT` をブランチごとに解析します |
 | **結果集合を変えない修飾** | `PARTITION (p)` / `SAMPLE (n)` / `AS OF TIMESTAMP` / `AS OF SCN`（フラッシュバック。時刻を `SYSTIMESTAMP - INTERVAL '1' HOUR` のような式で書いた形を含む）/ `FOR UPDATE [OF …] [NOWAIT]` / `table@dblink` / `ORDER SIBLINGS BY` は取り除いてから解析します |
-| **その他** | `DUAL`、`SELECT UNIQUE`、`NVL` / `DECODE` / `TO_DATE` / `EXTRACT` / `REGEXP_*` などの関数、`LISTAGG … WITHIN GROUP`、分析関数 `OVER (…)`（`PARTITION BY` / `ORDER BY` / ウィンドウ枠）、`ROLLUP` / `CUBE`、`NULLS FIRST/LAST`、代替引用符 `q'[…]'`、引用識別子 `"Name"`、`#` / `$` を含む識別子（`SERIAL#` / `V$SESSION`）、`DELETE` の `FROM` 省略形 |
+| **その他** | `DUAL`、`SELECT UNIQUE`、`NVL` / `DECODE` / `TO_DATE` / `EXTRACT` / `REGEXP_*` などの関数、`LISTAGG … WITHIN GROUP`、集約の `KEEP (DENSE_RANK …)`、分析関数 `OVER (…)`（`PARTITION BY` / `ORDER BY` / ウィンドウ枠の `ROWS` と `RANGE`）、`ROLLUP` / `CUBE`、`NULLS FIRST/LAST`、代替引用符 `q'[…]'`、引用識別子 `"Name"`、`#` / `$` を含む識別子（`SERIAL#` / `V$SESSION`）、`DELETE` の `FROM` 省略形 |
 
 ### その他
 
@@ -142,8 +142,9 @@ npm run check:browser # ビルド + 実際の Chrome で dist/ を操作して�
 - INSERT / MERGE / DDL / PL/SQL ブロックなど、SELECT / UPDATE / DELETE 以外
 - 複数文（`;` 区切りで 2 文以上）— 1 文目だけ解析して残りを黙って捨てないよう、エラーにします
 - 括弧でまとめた JOIN（`a LEFT JOIN (b JOIN c ON …) ON …`）と、集合演算の右側だけを括弧で囲む書き方（`SELECT … UNION (SELECT …)`）— SQL パーサーが一部のテーブルやブランチを読み飛ばすため、エラーにします
-- PIVOT / UNPIVOT、`GROUP BY GROUPING SETS`、MODEL 句、MATCH_RECOGNIZE、`CROSS APPLY` / `OUTER APPLY`、XMLTABLE / JSON_TABLE
-- ウィンドウ枠の境界に式を書く形（`RANGE BETWEEN UNBOUNDED PRECEDING AND (sal/2) PRECEDING`）
+- PIVOT / UNPIVOT、`GROUP BY GROUPING SETS`、MODEL 句、MATCH_RECOGNIZE、`CROSS APPLY` / `OUTER APPLY`、XMLTABLE / JSON_TABLE、FROM 句の `TABLE(…)`
+- 再帰的な WITH の `SEARCH` 句と `CYCLE` 句、UPDATE / DELETE の `RETURNING … INTO`
+- ウィンドウ枠の境界に式や INTERVAL を書く形（`RANGE BETWEEN UNBOUNDED PRECEDING AND (sal/2) PRECEDING`、`RANGE INTERVAL '7' DAY PRECEDING`）
 - ウィンドウ関数の専用説明（構文としては解析します）
 - 実行計画・実際の行数取得（解析・可視化のみ）
 
