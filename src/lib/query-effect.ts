@@ -96,7 +96,12 @@ const COUNT_DISTINCT_PATTERN = /(?<![\w$#.`"\u0080-\uFFFF])COUNT\s*\(\s*DISTINCT
 function hasGroupingAggregate(col: SelectColumn): boolean {
   const masked = maskNonCode(col.expression);
   for (const match of masked.matchAll(AGGREGATE_CALL_RE)) {
-    const callEnd = readBalancedParenEnd(masked, match.index + match[0].length - 1);
+    let callEnd = readBalancedParenEnd(masked, match.index + match[0].length - 1);
+    // `LISTAGG(…) WITHIN GROUP (…) OVER (…)` や `MAX(…) KEEP (…) OVER (…)` は、OVER の前に句が挟まる
+    const between = callEnd === null ? null : /^\s*(?:WITHIN\s+GROUP|KEEP)\s*\(/i.exec(masked.slice(callEnd));
+    if (callEnd !== null && between) {
+      callEnd = readBalancedParenEnd(masked, callEnd + between[0].length - 1) ?? callEnd;
+    }
     if (callEnd !== null && /^\s*OVER\b/i.test(masked.slice(callEnd))) continue;
     return true;
   }
@@ -179,7 +184,7 @@ function describePostProcessLinesJapanese(query: ParsedQuery): EffectLine[] {
     // （Oracle Database 23 SQL Language Reference「ROWNUM Pseudocolumn」）
     if (whereHasRownum(query.where)) {
       lines.push({
-        text: 'ROWNUM と ORDER BY — ORDER BY は ROWNUM で絞ったあとの行を並べ替えるので、並べ替えた結果の上位の行になるとは限らない（上位の行を取るには、ORDER BY を書いたサブクエリの外で ROWNUM を使うか、FETCH FIRST を使う）',
+        text: 'ROWNUM と ORDER BY — ORDER BY は ROWNUM で絞ったあとの行を並べ替える。残る行は、並べ替えた結果の上位の行とは限らない（上位の行を取るには、ORDER BY を書いたサブクエリの外で ROWNUM を使うか、FETCH FIRST を使う）',
         sourceSpan: query.orderBy[0]?.sourceSpan,
       });
     }
@@ -737,8 +742,18 @@ function crossJoinPhrase(join: JoinEdge, tables: TableRef[]): string {
 /** 値の一覧（`(1, NULL)`）に NULL が書かれているか。文字列の中の NULL は数えない */
 function listContainsNullLiteral(label: string): boolean {
   const masked = maskNonCode(label);
-  const open = masked.lastIndexOf('(');
-  return open >= 0 && /(?:^|,)\s*NULL\s*(?:,|$)/i.test(masked.slice(open + 1).replace(/\)\s*$/, ''));
+  const inList = /\bIN\s*\(/i.exec(masked);
+  if (!inList) return false;
+  const open = inList.index + inList[0].length - 1;
+  const close = readBalancedParenEnd(masked, open);
+  if (close === null) return false;
+  // 一覧の中の括弧（`NVL(x, NULL)` のような関数の引数）は、一覧の値ではないので伏せる
+  let items = masked.slice(open + 1, close - 1);
+  for (let previous = ''; previous !== items; ) {
+    previous = items;
+    items = items.replace(/\([^()]*\)/g, (group) => ' '.repeat(group.length));
+  }
+  return /(?:^|,)\s*NULL\s*(?:,|$)/i.test(items);
 }
 
 function inConditionPhrase(node: ConditionNode): string {

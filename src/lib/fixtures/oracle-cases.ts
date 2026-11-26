@@ -371,6 +371,26 @@ WHERE t.total > 1000`,
     },
   },
   {
+    name: 'schema を付けた列と、引用符の要る別名でも、カンマ結合の (+) を外部結合として読む',
+    category: 'oracle',
+    sql: 'SELECT * FROM sch.a, sch.b, emp "E E" WHERE sch.a.id = sch.b.a_id(+) AND "E E".a_id = sch.a.id',
+    expectSuccess: true,
+    assert: (q) => {
+      const joins = q.joins.map((j) => [j.type, j.condition]);
+      const expected = [
+        ['LEFT JOIN', 'sch.a.id = sch.b.a_id(+)'],
+        ['INNER JOIN', '"E E".a_id = sch.a.id'],
+      ];
+      if (JSON.stringify(joins) !== JSON.stringify(expected)) throw new Error(JSON.stringify(joins));
+    },
+  },
+  {
+    name: '別名に cycle と付けたインラインビューを、CYCLE 句と取り違えない',
+    category: 'update',
+    sql: 'UPDATE (SELECT e.sal FROM emp e) cycle SET cycle.sal = 1',
+    expectSuccess: true,
+  },
+  {
     name: '括弧の中で集合演算をまとめる書き方は、未対応と伝える',
     category: 'error',
     sql: '(SELECT x FROM t1 MINUS SELECT x FROM t2) INTERSECT SELECT x FROM t3',

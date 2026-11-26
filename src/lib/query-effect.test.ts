@@ -1253,3 +1253,30 @@ describe('ROWNUM の条件', () => {
     expect(lines('SELECT * FROM (SELECT e.id FROM emp e ORDER BY e.sal DESC) WHERE ROWNUM <= 10').some((t) => t.startsWith('ROWNUM と ORDER BY'))).toBe(false);
   });
 });
+
+describe('NOT IN の一覧の中の関数の NULL', () => {
+  const leafText = (where: string): string => {
+    const parsed = parseOracleQuery(`SELECT t.id FROM t WHERE ${where}`);
+    if (!parsed.success) throw new Error(parsed.error.message);
+    const filter = buildQueryEffect(parsed.query, 'japanese').sections.find((s) => s.kind === 'filter');
+    return filter?.conditionRoot?.text ?? filter?.conditionRoot?.label ?? '';
+  };
+
+  it('関数の引数の NULL は一覧の値ではないので、どの行も残らないとは書かない', () => {
+    expect(leafText('t.id NOT IN (NVL(t.a, NULL), 2)')).not.toContain('どの行も残らない');
+    expect(leafText('t.id NOT IN (2, NVL(t.a, NULL))')).not.toContain('どの行も残らない');
+    expect(leafText('t.id NOT IN (1, NULL, NVL(t.a, 1))')).toContain('一覧に NULL があるので');
+  });
+});
+
+describe('WITHIN GROUP / KEEP の付いた分析関数', () => {
+  it('OVER の付いた LISTAGG … WITHIN GROUP と MAX … KEEP は、行をまとめる集約として数えない', () => {
+    const parsed = parseOracleQuery(
+      "SELECT LISTAGG(e.name, ',') WITHIN GROUP (ORDER BY e.name) OVER (PARTITION BY e.d) l, MAX(e.s) KEEP (DENSE_RANK LAST ORDER BY e.h) OVER (PARTITION BY e.d) m FROM emp e",
+    );
+    if (!parsed.success) throw new Error(parsed.error.message);
+    const effect = buildQueryEffect(parsed.query, 'japanese');
+    expect(effect.summary).not.toContain('集約');
+    expect(effect.sections.some((s) => s.kind === 'aggregate')).toBe(false);
+  });
+});

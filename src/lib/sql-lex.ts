@@ -171,8 +171,11 @@ export function readBalancedParenEnd(text: string, openPos: number): number | nu
   return null;
 }
 
-/** 文字列リテラル・コメント・引用識別子以外の領域 */
-export function findCodeRegions(sql: string): CodeRegion[] {
+/**
+ * 文字列リテラル・コメント・引用識別子以外の領域。
+ * keepQuotedIdentifiers を付けると、引用識別子（`"E E"`）もコードの領域に含める
+ */
+export function findCodeRegions(sql: string, keepQuotedIdentifiers = false): CodeRegion[] {
   const regions: CodeRegion[] = [];
   let codeStart = 0;
   let i = 0;
@@ -216,6 +219,10 @@ export function findCodeRegions(sql: string): CodeRegion[] {
     }
 
     if (ch === '"') {
+      if (keepQuotedIdentifiers) {
+        i = readQuotedIdentifierEnd(sql, i);
+        continue;
+      }
       closeCode(i);
       i = readQuotedIdentifierEnd(sql, i);
       codeStart = i;
@@ -231,7 +238,18 @@ export function findCodeRegions(sql: string): CodeRegion[] {
 
 /** 文字列・コメント・引用識別子を同じ長さの空白に置き換える。オフセットは元 SQL と一致する */
 export function maskNonCode(sql: string): string {
-  const regions = findCodeRegions(sql);
+  return maskOutside(sql, findCodeRegions(sql));
+}
+
+/**
+ * 文字列とコメントだけを同じ長さの空白に置き換え、引用識別子（`"E E"`）は残す。
+ * 式の中の表の参照（`"E E".id`）を探すときに使う
+ */
+export function maskLiteralsAndComments(sql: string): string {
+  return maskOutside(sql, findCodeRegions(sql, true));
+}
+
+function maskOutside(sql: string, regions: CodeRegion[]): string {
   let masked = '';
   let pos = 0;
   for (const region of regions) {

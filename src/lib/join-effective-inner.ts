@@ -1,6 +1,6 @@
 import type { ConditionNode, JoinEdge, JoinType, ParsedQuery, TableRef } from './types';
 import { NO_JOIN_CONDITION, joinConditionDisplayText, resolveJoinConditionExpression } from './join-condition';
-import { maskNonCode, readBalancedParenEnd } from './sql-lex';
+import { maskLiteralsAndComments, readBalancedParenEnd } from './sql-lex';
 
 export interface EffectiveInnerReason {
   kind: 'inner_join' | 'where' | 'having';
@@ -96,19 +96,26 @@ function tableReferenceIdentifiers(table: TableRef, allTables: TableRef[]): stri
  * テーブル参照を走査する前に文字列リテラル・コメントを空白へ潰す。
  * `WHERE u.note = 'o.id'` の `'o.id'` を orders への参照と誤読すると、
  * 絞り込みが無い LEFT JOIN を実質 INNER と判定してしまう。
- * maskNonCode は長さを保つので、マスク後の位置は元の式の位置と一致する。
+ * 引用符で囲んだ名前は、表の参照（`"E E".id`）を探すために残す。長さを保つので、マスク後の位置は元の式の位置と一致する。
  */
 function maskExprLiterals(expr: string): string {
-  return maskNonCode(expr);
+  return maskLiteralsAndComments(expr);
+}
+
+/**
+ * 式の中で `id.` の形の参照を探す正規表現。引用符で囲んだ形（`"E E".`）も探す。
+ * 前の文字は、名前に使える文字でないことだけを確かめる。`\b` は ASCII の文字しか語として扱わないので、
+ * 日本語の名前（`売上.`）の前では境界にならない。schema 付きの参照（`sch.tab.`）を探せるよう、前の `.` は許す
+ */
+function qualifierPattern(id: string, flags: string): RegExp {
+  const quoted = `"${escapeRegex(id.replace(/"/g, '""'))}"`;
+  return new RegExp(`(?<![\\w$#\\u0080-\\uFFFF"])(?:${escapeRegex(id)}|${quoted})\\.`, flags);
 }
 
 function expressionReferencesTable(expr: string, identifiers: string[]): boolean {
   if (!expr) return false;
   const masked = maskExprLiterals(expr);
-  return identifiers.some((id) => {
-    const pattern = new RegExp(`\\b${escapeRegex(id)}\\.`, 'i');
-    return pattern.test(masked);
-  });
+  return identifiers.some((id) => qualifierPattern(id, 'i').test(masked));
 }
 
 export function isInnerJoinType(type: JoinType): boolean {
@@ -224,7 +231,7 @@ function tableRefStartPositions(rawExpr: string, identifiers: string[]): number[
   const expr = maskExprLiterals(rawExpr);
   const positions: number[] = [];
   for (const id of identifiers) {
-    const pattern = new RegExp(`\\b${escapeRegex(id)}\\.`, 'gi');
+    const pattern = qualifierPattern(id, 'gi');
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(expr)) !== null) {
       positions.push(match.index);
@@ -539,6 +546,7 @@ function reasonsForNullableTable(
   nullableTable: TableRef,
   joinDerivedIds: Set<string>,
   effectiveInnerJoinIds: ReadonlySet<string>,
+  ignoreHavingReasons: boolean,
 ): EffectiveInnerReason[] {
   const identifiers = tableReferenceIdentifiers(nullableTable, query.tables);
   if (identifiers.length === 0) return [];
@@ -546,11 +554,14 @@ function reasonsForNullableTable(
   return dedupeReasons([
     ...findSubsequentInnerJoinReasons(query.joins, query.tables, joinIndex, identifiers, joinDerivedIds, effectiveInnerJoinIds),
     ...collectConditionReasons(query, 'where', identifiers, joinDerivedIds),
-    ...collectConditionReasons(query, 'having', identifiers, joinDerivedIds),
+    ...(ignoreHavingReasons ? [] : collectConditionReasons(query, 'having', identifiers, joinDerivedIds)),
   ]);
 }
 
-export function analyzeEffectiveInnerJoins(query: ParsedQuery): EffectiveInnerAnalysis[] {
+export function analyzeEffectiveInnerJoins(
+  query: ParsedQuery,
+  options?: NormalizeEffectiveInnerOptions,
+): EffectiveInnerAnalysis[] {
   const results: EffectiveInnerAnalysis[] = [];
   const joinDerivedIds = joinDerivedConditionIds(query.joins);
   const effectiveInnerJoinIds = new Set<string>();
@@ -567,7 +578,14 @@ export function analyzeEffectiveInnerJoins(query: ParsedQuery): EffectiveInnerAn
     const nullableTableIds: string[] = [];
 
     for (const nullableTable of sideTables) {
-      const tableReasons = reasonsForNullableTable(query, joinIndex, nullableTable, joinDerivedIds, effectiveInnerJoinIds);
+      const tableReasons = reasonsForNullableTable(
+        query,
+        joinIndex,
+        nullableTable,
+        joinDerivedIds,
+        effectiveInnerJoinIds,
+        options?.ignoreHavingReasons ?? false,
+      );
       if (tableReasons.length === 0) continue;
       nullableTableIds.push(nullableTable.id);
       reasons.push(...tableReasons);
@@ -635,14 +653,9 @@ function analysesForNormalization(
   query: ParsedQuery,
   options?: NormalizeEffectiveInnerOptions,
 ): EffectiveInnerAnalysis[] {
-  const analyses = analyzeEffectiveInnerJoins(query);
-  if (!options?.ignoreHavingReasons) return analyses;
-  return analyses
-    .map((analysis) => ({
-      ...analysis,
-      reasons: analysis.reasons.filter((reason) => reason.kind !== 'having'),
-    }))
-    .filter((analysis) => analysis.reasons.length > 0);
+  // HAVING を除くときは、判定の途中から除く。あとから理由だけを消すと、HAVING で実質 INNER JOIN になった結合を経由して
+  // 前の結合を実質 INNER JOIN とした判定（後続の実質 INNER JOIN による）が残る
+  return analyzeEffectiveInnerJoins(query, options);
 }
 
 /** 実質 INNER JOIN と判定された外部結合を INNER JOIN として比較用に正規化する（CTE・派生・UNION 内も再帰） */

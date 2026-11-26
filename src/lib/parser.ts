@@ -1449,12 +1449,35 @@ function tableQualifierKey(table: TableRef): string {
   return (table.alias ?? table.table).toUpperCase();
 }
 
-/** `e.deptno` のような修飾付き参照から、対応するテーブルの添字を引く */
+/** 名前の 1 つ分（`"E E"` のような引用識別子か、引用符なしの名前） */
+const NAME_PART_SOURCE = String.raw`(?:"(?:[^"]|"")*"|[\p{L}\p{N}\p{M}_$#]+)`;
+/** 式の先頭の、`.` でつないだ名前の並び（`e.deptno`、`sch.emp.deptno`、`"E E".id`） */
+const QUALIFIED_NAME_RE = new RegExp(String.raw`^\s*(${NAME_PART_SOURCE}(?:\s*\.\s*${NAME_PART_SOURCE})+)`, 'u');
+const NAME_PART_RE = new RegExp(NAME_PART_SOURCE, 'gu');
+
+function unquoteNamePart(part: string): string {
+  return part.startsWith('"') ? part.slice(1, -1).replace(/""/g, '"') : part;
+}
+
+/**
+ * `e.deptno` のような修飾付き参照から、対応するテーブルの添字を引く。
+ * 式の表示は、schema を付けた列（`sch.emp.deptno`）と、引用符が要る名前（`"E E".id`）をそのまま書くので、
+ * 最初の `.` の前だけを見ると、schema を表の名前と取り違え、引用符付きの名前を見つけられない
+ */
 function tableIndexOfExpression(expression: string | undefined, tables: TableRef[]): number {
   if (!expression) return -1;
-  const qualifier = expression.split('.')[0]?.trim().toUpperCase();
-  if (!qualifier || qualifier === expression.trim().toUpperCase()) return -1;
-  return tables.findIndex((table) => tableQualifierKey(table) === qualifier);
+  const chain = QUALIFIED_NAME_RE.exec(expression)?.[1];
+  if (!chain) return -1;
+  const parts = (chain.match(NAME_PART_RE) ?? []).map((part) => unquoteNamePart(part).toUpperCase());
+  // 最後は列の名前。その前が表（または別名）、さらに前があれば schema
+  const qualifier = parts[parts.length - 2];
+  const schema = parts.length > 2 ? parts[parts.length - 3] : undefined;
+  if (!qualifier) return -1;
+  return tables.findIndex(
+    (table) =>
+      tableQualifierKey(table) === qualifier &&
+      (schema === undefined || (!table.alias && (table.schema ?? '').toUpperCase() === schema)),
+  );
 }
 
 /** AND で連結された最上位の条件だけを集める（OR の下は結合条件として扱わない） */
@@ -1906,7 +1929,10 @@ const UNSUPPORTED_SYNTAX: Array<{ pattern: RegExp; message: string }> = [
     message: 'FROM 句の TABLE(…)（コレクションや関数の結果を表として読む書き方）は未対応です',
   },
   {
-    pattern: /\)\s*(?:SEARCH\s+(?:DEPTH|BREADTH)\s+FIRST\s+BY|CYCLE\s+[^;]*?\bSET\b)/i,
+    // CYCLE 句は `CYCLE 列 [, 列]… SET 印の列 TO 値 DEFAULT 値`。`SET … TO` まで見る。
+    // `UPDATE (SELECT …) cycle SET cycle.sal = 1` の別名 cycle と取り違えない
+    pattern:
+      /\)\s*(?:SEARCH\s+(?:DEPTH|BREADTH)\s+FIRST\s+BY|CYCLE\s+[^;()]*?\bSET\s+[^;()=]*?\bTO\b)/i,
     message: '再帰的な WITH の SEARCH 句と CYCLE 句は未対応です',
   },
   {

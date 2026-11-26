@@ -765,3 +765,30 @@ describe('OR のすべての枝が NULL をはじくとき', () => {
     expect(analyze(where)).toEqual([]);
   });
 });
+
+describe('表の参照の見つけ方（日本語の名前・引用符の要る別名・HAVING を除く正規化）', () => {
+  it('別名の無い日本語の名前の表も、WHERE の参照を見つける', () => {
+    const analyses = analyzeEffectiveInnerJoins(
+      parseSql('SELECT 売上.id FROM 売上 LEFT JOIN 明細 ON 明細.売上id = 売上.id WHERE 明細.数量 > 0'),
+    );
+    expect(analyses).toHaveLength(1);
+  });
+
+  it('引用符の要る別名の表も、WHERE の参照を見つける', () => {
+    const analyses = analyzeEffectiveInnerJoins(
+      parseSql('SELECT a.id FROM table_a a LEFT JOIN table_b "B B" ON "B B".a_id = a.id WHERE "B B".x = 1'),
+    );
+    expect(analyses).toHaveLength(1);
+  });
+
+  it('HAVING を除く正規化では、HAVING で実質 INNER JOIN になった結合を経由して前の結合を正規化しない', () => {
+    const query = parseSql(
+      'SELECT a.id FROM table_a a LEFT JOIN table_b b ON b.a_id = a.id LEFT JOIN table_c c ON c.b_id = b.id GROUP BY a.id HAVING SUM(c.v) > 0',
+    );
+    expect(normalizeEffectiveInnerJoins(query).joins.map((j) => j.type)).toEqual(['INNER JOIN', 'INNER JOIN']);
+    expect(normalizeEffectiveInnerJoins(query, { ignoreHavingReasons: true }).joins.map((j) => j.type)).toEqual([
+      'LEFT JOIN',
+      'LEFT JOIN',
+    ]);
+  });
+});
