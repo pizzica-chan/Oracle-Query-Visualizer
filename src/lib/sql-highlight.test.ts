@@ -27,16 +27,27 @@ describe('sql-highlight', () => {
   });
 
   it('長い SQL でも短い時間で色分けする（文字ごとに正規表現を作り直さない）', () => {
-    const sql = Array.from(
-      { length: 1500 },
-      (_, i) => `SELECT u${i}.id, u${i}.name FROM users u${i} JOIN orders o${i} ON o${i}.user_id = u${i}.id WHERE o${i}.total > ${i}`,
-    ).join('\nUNION ALL\n');
-    const started = performance.now();
-    const restored = tokenizeSql(sql).map((t) => t.text).join('');
-    const elapsed = performance.now() - started;
-    expect(restored).toBe(sql);
-    // 直す前は 1 秒を超えていた。遅い CI でも通るよう、余裕を持たせる
-    expect(elapsed).toBeLessThan(400);
+    const build = (count: number) =>
+      Array.from(
+        { length: count },
+        (_, i) => `SELECT u${i}.id, u${i}.name FROM users u${i} JOIN orders o${i} ON o${i}.user_id = u${i}.id WHERE o${i}.total > ${i}`,
+      ).join('\nUNION ALL\n');
+    // 実行機の速さで時間は大きく変わる（CI では、直したあとのコードでも 1 秒近くかかったことがある）。
+    // 絶対の時間ではなく、SQL を 2 倍の長さにしたときの時間の比で確かめる。直す前の作り（残りの文字列を
+    // 1 文字ごとに切り出す）は長さの 2 乗で遅くなり比が 4 倍前後になる。長さに比例する作りなら 2 倍前後
+    const fastest = (sql: string) => {
+      let best = Infinity;
+      for (let run = 0; run < 3; run++) {
+        const started = performance.now();
+        const restored = tokenizeSql(sql).map((t) => t.text).join('');
+        best = Math.min(best, performance.now() - started);
+        expect(restored).toBe(sql);
+      }
+      return best;
+    };
+    const short = fastest(build(750));
+    const long = fastest(build(1500));
+    expect(long / short).toBeLessThan(3);
   });
 
   it('行ごとの HTML は行数と一致し、行をまたぐコメントは行の境目で span を閉じて開き直す', () => {
