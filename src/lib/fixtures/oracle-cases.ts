@@ -541,6 +541,19 @@ FROM c`;
     },
   },
   {
+    name: 'インラインビューも SQL 上の範囲（括弧から別名まで）を持つ（JOIN 図のノードと SQL が連動する）',
+    category: 'subquery',
+    sql: 'SELECT "V".id, w.id FROM a, (SELECT 1 id FROM dual) /* c */ "V", (SELECT 2 id FROM dual) w WHERE w.id = "V".id AND a.id = w.id',
+    expectSuccess: true,
+    assert: (q) => {
+      const sql =
+        'SELECT "V".id, w.id FROM a, (SELECT 1 id FROM dual) /* c */ "V", (SELECT 2 id FROM dual) w WHERE w.id = "V".id AND a.id = w.id';
+      const texts = q.tables.map((t) => (t.sourceSpan ? sql.slice(t.sourceSpan.start, t.sourceSpan.end) : null));
+      const expected = ['a', '(SELECT 1 id FROM dual) /* c */ "V"', '(SELECT 2 id FROM dual) w'];
+      if (JSON.stringify(texts) !== JSON.stringify(expected)) throw new Error(JSON.stringify(texts));
+    },
+  },
+  {
     name: 'インラインビューの名前の括弧は全角で、作用の説明と同じ書き方にする',
     category: 'subquery',
     sql: 'SELECT v.sal FROM (SELECT e.sal FROM emp e) v',

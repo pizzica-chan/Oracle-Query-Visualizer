@@ -14,13 +14,13 @@ describe('effect-text-highlight', () => {
     if (!query.success) return;
 
     const line =
-      'o と order_items（oi）は実質 INNER JOIN — 結合条件「oi.order_id = o.id」を満たす組み合わせのみ残る。SQL上は LEFT JOIN（order_items（oi）が無い行も o は残る）だが、後続の INNER JOIN により order_items（oi）が無い行も除外される';
+      'o と order_items（oi） は実質 INNER JOIN — 結合条件「oi.order_id = o.id」を満たす組み合わせのみ残る。SQL 上は LEFT JOIN（order_items（oi） が無い行も o は残る）だが、後続の INNER JOIN により order_items（oi） が無い行も除外される';
     const highlighted = kinds(line, query.query);
 
     expect(highlighted.some((s) => s.kind === 'keyword' && s.text === '実質 INNER JOIN')).toBe(true);
     expect(highlighted.some((s) => s.kind === 'keyword' && s.text === 'LEFT JOIN')).toBe(true);
     expect(highlighted.some((s) => s.kind === 'keyword' && s.text === 'INNER JOIN')).toBe(true);
-    expect(highlighted.some((s) => s.kind === 'keyword' && s.text === 'SQL上は')).toBe(true);
+    expect(highlighted.some((s) => s.kind === 'keyword' && s.text === 'SQL 上は')).toBe(true);
     expect(highlighted.some((s) => s.kind === 'table' && s.text === 'order_items（oi）')).toBe(true);
     expect(highlighted.some((s) => s.kind === 'table' && s.text === 'o')).toBe(true);
   });
@@ -60,7 +60,7 @@ describe('effect-text-highlight', () => {
     if (!query.success) return;
 
     const line =
-      'o と order_items（oi）は実質 INNER JOIN — 結合条件「oi.order_id = o.id」を満たす組み合わせのみ残る';
+      'o と order_items（oi） は実質 INNER JOIN — 結合条件「oi.order_id = o.id」を満たす組み合わせのみ残る';
     const restored = segmentEffectText(line, query.query).map((s) => s.text).join('');
     expect(restored).toBe(line);
   });

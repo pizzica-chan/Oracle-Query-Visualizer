@@ -20,7 +20,7 @@ const SQL_KEYWORDS = [
   'GROUP BY',
   'ORDER BY',
   'IS NULL',
-  'SQL上は',
+  'SQL 上は',
   'WHERE',
   'HAVING',
   'BETWEEN',

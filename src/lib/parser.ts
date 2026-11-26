@@ -8,7 +8,7 @@ import { Parser } from 'node-sql-parser/build/mysql';
 import { normalizeConditionTree } from './condition-tree-normalize';
 import { NO_JOIN_CONDITION, formatJoinConditionLabel } from './join-condition';
 import { fixLogicalOperatorPrecedence } from './logical-precedence';
-import { findUnclosedLiteral, isWordChar } from './sql-lex';
+import { findUnclosedLiteral, isWordChar, readBalancedParenEnd } from './sql-lex';
 import {
   maskNonCode,
   preprocessSqlForParser,
@@ -1194,6 +1194,35 @@ function fillMissingColumnSpans(columns: SelectColumn[], ast: any): SelectColumn
   });
 }
 
+/**
+ * インラインビューの範囲（`(SELECT …) v`）。パーサは FROM の項目としての位置を返さないので、
+ * 中の SELECT の範囲から、囲む括弧と後ろの別名まで広げる。範囲が無いと、JOIN 図のノードや
+ * 作用の説明の行をクリックしても、SQL と連動しない
+ */
+function derivedTableSourceSpan(inner: SourceSpan | undefined, alias: string | undefined): SourceSpan | undefined {
+  if (!inner) return undefined;
+  const masked = maskedProcessedSql();
+  let open = inner.start - 1;
+  while (open >= 0 && /\s/.test(masked[open]!)) open -= 1;
+  if (masked[open] !== '(') return inner;
+  const close = readBalancedParenEnd(masked, open);
+  if (close == null) return inner;
+  if (!alias) return { start: open, end: close };
+  // 括弧と別名のあいだの空白・コメント・AS を飛ばす（伏せた SQL では、コメントは空白になっている）
+  let pos = close;
+  const skipBlank = () => {
+    while (pos < masked.length && /\s/.test(masked[pos]!) && processedSql[pos] !== '`') pos += 1;
+  };
+  skipBlank();
+  const as = /^AS(?![\w$#])/i.exec(masked.slice(pos));
+  if (as) {
+    pos += as[0].length;
+    skipBlank();
+  }
+  const name = /^(?:`[^`]*`|[^\s,()]+)/.exec(processedSql.slice(pos));
+  return { start: open, end: name ? pos + name[0].length : close };
+}
+
 const PARENTHESIZED_JOIN_MESSAGE =
   '括弧でまとめた JOIN（例: a LEFT JOIN (b JOIN c ON …) ON …）には対応していません';
 
@@ -1229,7 +1258,7 @@ function buildTableRef(entry: any, index: number): TableRef {
       displayName: givenAlias ? `${name}（派生テーブル）` : `${name}（別名なし）`,
       isDerived: true,
       derivedQuery: span ? { ...derivedQuery, sourceSpan: span } : derivedQuery,
-      sourceSpan,
+      sourceSpan: sourceSpan ?? derivedTableSourceSpan(span, givenAlias),
     };
   }
 

@@ -7,6 +7,8 @@ export interface EffectiveInnerReason {
   label: string;
   /** kind === 'inner_join' のときの結合種別 */
   joinType?: JoinType;
+  /** kind === 'inner_join' で、後続の結合が SQL 上は外部結合で、実質 INNER JOIN になっているもの */
+  viaEffectiveInner?: boolean;
 }
 
 export interface EffectiveInnerAnalysis {
@@ -475,12 +477,16 @@ function findSubsequentInnerJoinReasons(
   joinIndex: number,
   identifiers: string[],
   joinDerivedIds: Set<string>,
+  effectiveInnerJoinIds: ReadonlySet<string>,
 ): EffectiveInnerReason[] {
   const reasons: EffectiveInnerReason[] = [];
 
   for (let i = joinIndex + 1; i < joins.length; i++) {
     const join = joins[i]!;
-    if (!isInnerLikeJoin(join)) continue;
+    // 後続の外部結合が実質 INNER JOIN なら、その結合条件も行を絞る（`a LEFT JOIN b … LEFT JOIN c ON c.b_id = b.id
+    // WHERE c.z > 0` は、c の無い行が除かれ、c と結び付いた b の無い行も残らない）
+    const viaEffectiveInner = !isInnerLikeJoin(join);
+    if (viaEffectiveInner && !effectiveInnerJoinIds.has(join.id)) continue;
     // ON に nullable 側の列が出てくるだけでは足りない。`ON p.id = o.pid OR p.aid = a.id` や
     // `ON p.id = NVL(o.pid, a.pid)` は未結合行でも成り立つので、WHERE と同じ基準で葉を調べる。
     // WHERE から作った結合（カンマ結合と旧式 (+)）の条件も、結合条件そのものとして調べる
@@ -493,6 +499,7 @@ function findSubsequentInnerJoinReasons(
       kind: 'inner_join',
       label: innerJoinReasonLabel(join, tables),
       joinType: join.type,
+      ...(viaEffectiveInner ? { viaEffectiveInner } : {}),
     });
   }
 
@@ -514,12 +521,13 @@ function reasonsForNullableTable(
   joinIndex: number,
   nullableTable: TableRef,
   joinDerivedIds: Set<string>,
+  effectiveInnerJoinIds: ReadonlySet<string>,
 ): EffectiveInnerReason[] {
   const identifiers = tableReferenceIdentifiers(nullableTable, query.tables);
   if (identifiers.length === 0) return [];
 
   return dedupeReasons([
-    ...findSubsequentInnerJoinReasons(query.joins, query.tables, joinIndex, identifiers, joinDerivedIds),
+    ...findSubsequentInnerJoinReasons(query.joins, query.tables, joinIndex, identifiers, joinDerivedIds, effectiveInnerJoinIds),
     ...collectConditionReasons(query, 'where', identifiers, joinDerivedIds),
     ...collectConditionReasons(query, 'having', identifiers, joinDerivedIds),
   ]);
@@ -528,38 +536,44 @@ function reasonsForNullableTable(
 export function analyzeEffectiveInnerJoins(query: ParsedQuery): EffectiveInnerAnalysis[] {
   const results: EffectiveInnerAnalysis[] = [];
   const joinDerivedIds = joinDerivedConditionIds(query.joins);
+  const effectiveInnerJoinIds = new Set<string>();
 
-  query.joins.forEach((join, joinIndex) => {
-    if (!isOuterJoinWithNullableSide(join.type)) return;
+  // 後ろの結合から順に調べる。ある外部結合が実質 INNER JOIN かどうかは、それより後ろの結合で決まる
+  for (let joinIndex = query.joins.length - 1; joinIndex >= 0; joinIndex--) {
+    const join = query.joins[joinIndex]!;
+    if (!isOuterJoinWithNullableSide(join.type)) continue;
 
     const sideTables = nullableSideTables(join, query.tables);
-    if (sideTables.length === 0) return;
+    if (sideTables.length === 0) continue;
 
     const reasons: EffectiveInnerReason[] = [];
     const nullableTableIds: string[] = [];
 
     for (const nullableTable of sideTables) {
-      const tableReasons = reasonsForNullableTable(query, joinIndex, nullableTable, joinDerivedIds);
+      const tableReasons = reasonsForNullableTable(query, joinIndex, nullableTable, joinDerivedIds, effectiveInnerJoinIds);
       if (tableReasons.length === 0) continue;
       nullableTableIds.push(nullableTable.id);
       reasons.push(...tableReasons);
     }
 
     if (reasons.length > 0) {
+      effectiveInnerJoinIds.add(join.id);
       results.push({
         joinId: join.id,
         reasons: dedupeReasons(reasons),
         nullableTableIds,
       });
     }
-  });
+  }
 
-  return results;
+  // 呼び出し元には、結合の順に返す
+  return results.reverse();
 }
 
 export function formatEffectiveInnerCausePhrase(reasons: EffectiveInnerReason[]): string {
   const innerReasons = reasons.filter((r) => r.kind === 'inner_join');
   if (innerReasons.length > 0) {
+    if (innerReasons.every((r) => r.viaEffectiveInner)) return '後続の実質 INNER JOIN により';
     const types = innerReasons.map((r) => r.joinType ?? 'INNER JOIN');
     const only = types[0];
     if (only && types.every((t) => t === only)) {
@@ -583,7 +597,7 @@ export function formatEffectiveInnerJoinScopeLine(
 ): string {
   const nullableLabel = tableDisplayLabel(nullableTable);
   const cause = formatEffectiveInnerCausePhrase(reasons);
-  return `${preservedLabel} と ${nullableLabel}は実質 INNER JOIN — 結合条件「${joinConditionDisplayText(join.condition)}」を満たす組み合わせのみ残る。SQL上は ${join.type}（${nullableLabel}が無い行も${preservedLabel}は残る）だが、${cause}${nullableLabel}が無い行も除外される`;
+  return `${preservedLabel} と ${nullableLabel} は実質 INNER JOIN — 結合条件「${joinConditionDisplayText(join.condition)}」を満たす組み合わせのみ残る。SQL 上は ${join.type}（${nullableLabel} が無い行も ${preservedLabel} は残る）だが、${cause} ${nullableLabel} が無い行も除外される`;
 }
 
 export function effectiveInnerAnalysisByJoinId(
