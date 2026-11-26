@@ -591,6 +591,48 @@ export function analyzeEffectiveInnerJoins(
   return results.reverse();
 }
 
+/** FULL JOIN の左右のうち、後続の条件で「相手が無い行」が除かれる側 */
+export interface FullJoinNullRejection {
+  joinId: string;
+  /** 左側（FROM 句で結合先より前の表）の行が無い組み合わせが除かれる */
+  leftRejected: boolean;
+  /** 結合先の行が無い組み合わせが除かれる */
+  rightRejected: boolean;
+  /** 左側の根拠 */
+  leftReasons: EffectiveInnerReason[];
+  /** 結合先の根拠 */
+  rightReasons: EffectiveInnerReason[];
+}
+
+/**
+ * FULL JOIN の左右それぞれについて、WHERE・HAVING・後続の INNER JOIN が、その側の NULL の行を除くかを調べる。
+ * `a FULL JOIN b ON … WHERE a.x > 0` は、a の無い（b だけの）行が除かれ、a LEFT JOIN b と同じ行になる。
+ * 両側とも除かれれば INNER JOIN と同じ。根拠の基準は LEFT JOIN / RIGHT JOIN の実質 INNER JOIN の判定と同じ
+ */
+export function analyzeFullJoinNullRejection(query: ParsedQuery): Map<string, FullJoinNullRejection> {
+  const result = new Map<string, FullJoinNullRejection>();
+  if (!query.joins.some((join) => join.type === 'FULL JOIN')) return result;
+  const joinDerivedIds = joinDerivedConditionIds(query.joins);
+  const effectiveInnerJoinIds = new Set(analyzeEffectiveInnerJoins(query).map((analysis) => analysis.joinId));
+  query.joins.forEach((join, joinIndex) => {
+    if (join.type !== 'FULL JOIN') return;
+    const targetIdx = tableIndexInFrom(query.tables, join.targetId);
+    if (targetIdx < 0) return;
+    const reasonsOf = (table: TableRef) =>
+      reasonsForNullableTable(query, joinIndex, table, joinDerivedIds, effectiveInnerJoinIds, false);
+    const leftReasons = dedupeReasons(query.tables.slice(0, targetIdx).flatMap(reasonsOf));
+    const rightReasons = reasonsOf(query.tables[targetIdx]!);
+    result.set(join.id, {
+      joinId: join.id,
+      leftRejected: leftReasons.length > 0,
+      rightRejected: rightReasons.length > 0,
+      leftReasons,
+      rightReasons,
+    });
+  });
+  return result;
+}
+
 export function formatEffectiveInnerCausePhrase(reasons: EffectiveInnerReason[]): string {
   const innerReasons = reasons.filter((r) => r.kind === 'inner_join');
   if (innerReasons.length > 0) {

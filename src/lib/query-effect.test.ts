@@ -476,6 +476,49 @@ WHERE a.id = b.a_id(+)
       expect(optional).toHaveLength(0);
     });
 
+    it('FULL JOIN は、FROM の最初の表も含めて両側を任意にする', () => {
+      const result = parseOracleQuery(`
+        SELECT * FROM emp e JOIN loc l ON l.id = e.loc_id
+        FULL JOIN dept d ON d.id = e.dept_id
+      `);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const { required, optional } = classifyTablePresenceRequirement(result.query);
+      expect(required).toHaveLength(0);
+      expect(optional.map((t) => t.alias)).toEqual(['e', 'l', 'd']);
+    });
+
+    it.each([
+      ['WHERE e.salary > 10', ['e'], ['d'], '実質 LEFT JOIN'],
+      ['WHERE d.id > 1', ['d'], ['e'], '実質 RIGHT JOIN'],
+      ['WHERE e.salary > 10 AND d.id > 1', ['e', 'd'], [], '実質 INNER JOIN'],
+      ['WHERE e.salary > 10 OR d.id > 1', [], ['e', 'd'], 'を FULL JOIN'],
+    ])('FULL JOIN の %s は、NULL の行を除く側を必須にし、作用説明に書く', (where, req, opt, phrase) => {
+      const result = parseOracleQuery(`SELECT e.name FROM emp e FULL JOIN dept d ON d.id = e.dept_id ${where}`);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const { required, optional } = classifyTablePresenceRequirement(result.query);
+      expect(required.map((t) => t.alias)).toEqual(req);
+      expect(optional.map((t) => t.alias)).toEqual(opt);
+      const scope = buildQueryEffect(result.query, 'japanese').sections.find((s) => s.kind === 'scope');
+      expect((scope?.lines ?? []).map((l) => l.text).join('\n')).toContain(phrase);
+    });
+
+    it('FULL JOIN の結合先を後続の INNER JOIN が参照すると、結合先の側を必須にする', () => {
+      const result = parseOracleQuery(`
+        SELECT * FROM emp e FULL JOIN dept d ON d.id = e.dept_id
+        JOIN loc l ON l.id = d.loc_id
+      `);
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const { required, optional } = classifyTablePresenceRequirement(result.query);
+      expect(required.map((t) => t.alias)).toEqual(['d', 'l']);
+      expect(optional.map((t) => t.alias)).toEqual(['e']);
+    });
+
     it('LEFT JOIN の後に RIGHT JOIN すると左側チェーンは任意になる', () => {
       const result = parseOracleQuery(`
         SELECT *

@@ -45,7 +45,8 @@ src/lib/fixtures/ 全テストが共有する SQL ケース集と不変条件ア
   → node-sql-parser（MySQL ビルド）で AST 化
   → parser.ts で ParsedQuery へ変換（記録した Oracle 構文を各 SELECT へ割り当てる）
   → remapParsedQuerySpans で全 sourceSpan を元 SQL の座標へ戻し、
-    shiftParsedQuerySpans で先頭の空白の分ずらし、trimParsedQuerySpanEnds で範囲の後ろの空白とコメントを除く
+    shiftParsedQuerySpans で先頭の空白の分ずらし、trimParsedQuerySpanEnds で範囲の後ろの空白とコメントを除き、
+    extendParsedQuerySpansOverOuterJoinMarks で直後の (+) を範囲に入れる
 ```
 
 ## パーサ選定の経緯（変更前に必ず読む）

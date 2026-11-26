@@ -2,13 +2,16 @@ import type { ConditionNode, JoinEdge, ParsedQuery, SelectColumn, SetClause, Sou
 import { formatJoinDisplayType } from './parser';
 import { getUpdateTargetTables } from './query-utils';
 import {
+  analyzeFullJoinNullRejection,
   conditionTreeWithoutJoinConditions,
   effectiveInnerAnalysisByJoinId,
+  formatEffectiveInnerCausePhrase,
   formatEffectiveInnerJoinScopeLine,
   isInnerLikeJoin,
   isCartesianJoin,
   type EffectiveInnerAnalysis,
   type EffectiveInnerReason,
+  type FullJoinNullRejection,
 } from './join-effective-inner';
 import { joinConditionDisplayText } from './join-condition';
 import { resolveJoinLayoutSources } from './join-graph-layout';
@@ -340,10 +343,34 @@ const JOIN_SCOPE: Record<string, (left: string, right: string, condition: string
     `${l} の行をすべて残し ${r} を LEFT JOIN — 結合条件「${c}」（${r} が無くても ${l} は残る）`,
   'RIGHT JOIN': (l, r, c) =>
     `${r} の行をすべて残し ${l} を RIGHT JOIN — 結合条件「${c}」`,
-  'FULL JOIN': (l, r, c) => `${l} と ${r} を FULL JOIN — 結合条件「${c}」`,
+  'FULL JOIN': (l, r, c) => `${l} と ${r} を FULL JOIN — 結合条件「${c}」（相手が無くても、${l} と ${r} の行がどちらも残る）`,
   'CROSS JOIN': (l, r, c) =>
     `${l} と ${r} を CROSS JOIN — 結合条件「${c}」を満たす組み合わせのみ残る`,
 };
+
+/**
+ * WHERE などで片側または両側の NULL の行が除かれる FULL JOIN の文。除かれない FULL JOIN は JOIN_SCOPE の文を使う。
+ * `a FULL JOIN b ON … WHERE a.x > 0` は、a の無い行が除かれて a LEFT JOIN b と同じ行になる
+ */
+function describeNullRejectedFullJoin(
+  left: string,
+  right: string,
+  condition: string,
+  rejection: FullJoinNullRejection,
+): string {
+  const c = joinConditionDisplayText(condition);
+  const sqlSide = `SQL 上は FULL JOIN（相手が無くても ${left} と ${right} の行がどちらも残る）だが`;
+  if (rejection.leftRejected && rejection.rightRejected) {
+    const cause = formatEffectiveInnerCausePhrase([...rejection.leftReasons, ...rejection.rightReasons]);
+    return `${left} と ${right} は実質 INNER JOIN — 結合条件「${c}」を満たす組み合わせのみ残る。${sqlSide}、${cause} ${left} が無い行も ${right} が無い行も除外される`;
+  }
+  if (rejection.leftRejected) {
+    const cause = formatEffectiveInnerCausePhrase(rejection.leftReasons);
+    return `${left} と ${right} は実質 LEFT JOIN — 結合条件「${c}」（${right} が無くても ${left} は残る）。${sqlSide}、${cause} ${left} が無い行は除外される`;
+  }
+  const cause = formatEffectiveInnerCausePhrase(rejection.rightReasons);
+  return `${left} と ${right} は実質 RIGHT JOIN — 結合条件「${c}」（${left} が無くても ${right} は残る）。${sqlSide}、${cause} ${right} が無い行は除外される`;
+}
 
 const MULTI_SOURCE_JOIN_SCOPE: Record<string, (sources: string, target: string, condition: string) => string> = {
   'INNER JOIN': (s, r, c) =>
@@ -355,7 +382,7 @@ const MULTI_SOURCE_JOIN_SCOPE: Record<string, (sources: string, target: string, 
     `${s} を基点に ${r} を LEFT JOIN — 結合条件「${c}」（${r} が無い組み合わせも LEFT 側は残る）`,
   'RIGHT JOIN': (s, r, c) =>
     `${r} を基点に ${s} を RIGHT JOIN — 結合条件「${c}」`,
-  'FULL JOIN': (s, r, c) => `${s} と ${r} を FULL JOIN — 結合条件「${c}」`,
+  'FULL JOIN': (s, r, c) => `${s} と ${r} を FULL JOIN — 結合条件「${c}」（相手が無くても、${s} と ${r} の行がどちらも残る）`,
   'CROSS JOIN': (s, r, c) =>
     `${s} と ${r} を CROSS JOIN — 結合条件「${c}」を満たす組み合わせのみ残る`,
 };
@@ -604,6 +631,7 @@ function expandRequiredUpstreamTables(
 /** JOIN 種別と実質 INNER から、結果行にレコードが必須か任意かを分類 */
 export function classifyTablePresenceRequirement(query: ParsedQuery): TablePresenceClassification {
   const effectiveInnerByJoin = effectiveInnerAnalysisByJoinId(query);
+  const fullJoinRejection = analyzeFullJoinNullRejection(query);
   const requiredIds = new Set<string>();
   const optionalIds = new Set<string>();
   const effectiveInnerTableIds = new Set<string>();
@@ -652,8 +680,22 @@ export function classifyTablePresenceRequirement(query: ParsedQuery): TablePrese
         markRightJoinLeftSideOptional(query, join, requiredIds, optionalIds);
       }
     } else if (join.type === 'FULL JOIN') {
-      optionalIds.add(join.targetId);
-      for (const id of sourceIds) optionalIds.add(id);
+      // FULL JOIN は、相手の無い行を両側とも残す。左側（結合先より前の表すべて）も結合先も、行が無いことがある。
+      // ただし WHERE などがその側の NULL の行を除くなら、その側の行は必ずある（analyzeFullJoinNullRejection）
+      const rejection = fullJoinRejection.get(join.id);
+      if (rejection?.rightRejected) {
+        requiredIds.add(join.targetId);
+        optionalIds.delete(join.targetId);
+      } else {
+        optionalIds.add(join.targetId);
+      }
+      if (!rejection?.leftRejected) {
+        const targetIdx = query.tables.findIndex((t) => t.id === join.targetId);
+        for (const table of query.tables.slice(0, Math.max(targetIdx, 0))) {
+          requiredIds.delete(table.id);
+          optionalIds.add(table.id);
+        }
+      }
     } else if (join.type === 'CROSS JOIN') {
       // ON / USING 付きは isInnerLikeJoin 側。ここは直積（ON なし）のみ
       requiredIds.add(join.targetId);
@@ -717,6 +759,7 @@ function describeJoinJapanese(
   join: JoinEdge,
   tables: TableRef[],
   effectiveInner?: { nullableTable: TableRef; reasons: EffectiveInnerReason[] },
+  fullJoinRejection?: FullJoinNullRejection,
 ): string {
   const sourceLabels = joinSourceLabels(join, tables);
   const sourcesText = sourceLabels.join('、');
@@ -726,6 +769,10 @@ function describeJoinJapanese(
   // 引くと JOIN_SCOPE に載らず汎用 JOIN 文へ落ち、「左側は残る」という外部結合の意味が消える
   const joinType = join.type;
   const condition = join.condition;
+
+  if (join.type === 'FULL JOIN' && (fullJoinRejection?.leftRejected || fullJoinRejection?.rightRejected)) {
+    return describeNullRejectedFullJoin(left, right, condition, fullJoinRejection);
+  }
 
   if (effectiveInner) {
     const preservedLabel = join.type === 'LEFT JOIN' ? left : right;
@@ -1223,10 +1270,11 @@ function describeScope(query: ParsedQuery, mode: QueryEffectMode): QueryEffectSe
         sourceSpan: query.tables[0]?.sourceSpan,
       });
       pushOptimizerHintLines(lines, query);
+      const fullJoinRejection = analyzeFullJoinNullRejection(query);
       for (const join of query.joins) {
         const effectiveInner = effectiveInnerForJoin(join, query, effectiveInnerByJoin);
         lines.push({
-          text: describeJoinJapanese(join, query.tables, effectiveInner),
+          text: describeJoinJapanese(join, query.tables, effectiveInner, fullJoinRejection.get(join.id)),
           sourceSpan: join.sourceSpan,
         });
       }

@@ -758,6 +758,45 @@ WHERE e.active = 1`;
     },
   },
   {
+    name: '複数列の同時更新は、各列にサブクエリの何列目を代入するかを書く',
+    category: 'update',
+    sql: 'UPDATE emp e SET (e.sal, e.comm) = (SELECT 1, 2 FROM dual), e.x = 3, (a, b, c) = (SELECT p, q, r FROM t)',
+    expectSuccess: true,
+    assert: (q) => {
+      const labels = q.setClauses?.map((s) => s.label).join(' | ');
+      const expected = [
+        'e.sal = (SELECT 2列 FROM DUAL) の 1 列目',
+        'e.comm = (SELECT 2列 FROM DUAL) の 2 列目',
+        'e.x = 3',
+        'a = (SELECT 3列 FROM t) の 1 列目',
+        'b = (SELECT 3列 FROM t) の 2 列目',
+        'c = (SELECT 3列 FROM t) の 3 列目',
+      ].join(' | ');
+      if (labels !== expected) throw new Error(labels);
+    },
+  },
+  {
+    // 構文図 update_set_clause: `( column [, column ]... ) = ( subquery )`。列が 1 つでも括弧で囲める
+    name: '1 列だけを括弧で囲んだ SET (a) = (SELECT …) も読む',
+    category: 'update',
+    sql: 'UPDATE emp e SET (sal) = (\n  -- c\n  SELECT 1 FROM dual), x = 1',
+    expectSuccess: true,
+    assert: (q) => {
+      const labels = q.setClauses?.map((s) => s.label).join(' | ');
+      if (labels !== 'sal = (SELECT 1列 FROM DUAL) | x = 1') throw new Error(labels);
+    },
+  },
+  {
+    name: 'SET の値の中の (x, y) = (SELECT …) は比較なので、複数列の同時更新として展開しない',
+    category: 'update',
+    sql: 'UPDATE emp e SET a = CASE WHEN (x, y) = (SELECT p, q FROM s) THEN 1 ELSE 0 END',
+    expectSuccess: true,
+    assert: (q) => {
+      const labels = q.setClauses?.map((s) => s.label).join(' | ');
+      if (labels !== 'a = CASE WHEN (x, y) = (SELECT 2列 FROM s) THEN 1 ELSE 0 END') throw new Error(labels);
+    },
+  },
+  {
     name: 'Oracle: 別名の無いインラインビューに、内部の仮の名前や SQL に無い別名を出さない',
     category: 'oracle',
     sql: 'SELECT * FROM (SELECT a.*, ROWNUM rnum FROM (SELECT emp_no FROM employees ORDER BY emp_no) a WHERE ROWNUM <= 20) WHERE rnum > 10',
@@ -794,6 +833,46 @@ FROM employees e START WITH e.manager_no IS NULL CONNECT BY PRIOR e.emp_no = e.m
     sql: "SELECT a.id FROM tab_a a, tab_b b WHERE a.id = b.a_id(+) AND b.kind(+) IN ('A', 'B')",
     expectSuccess: false,
     errorContains: 'IN で比べられません',
+  },
+  {
+    // SQL Language Reference「Joins」: (+) は FROM 句に JOIN の構文がある問い合わせのブロックでは使えない（ORA-25156）
+    name: 'Oracle: JOIN … ON の中の (+) は、JOIN の構文と混ぜた書き方としてエラーにする',
+    category: 'error',
+    sql: 'SELECT e.id FROM emp e INNER JOIN dept d ON e.dept_id = d.id(+)',
+    expectSuccess: false,
+    errorContains: 'JOIN を書いた SELECT では使えません',
+  },
+  {
+    name: 'Oracle: JOIN … ON とカンマ結合を混ぜた SELECT の WHERE の (+) もエラーにする',
+    category: 'error',
+    sql: 'SELECT e.id FROM emp e JOIN dept d ON d.id = e.dept_id, loc l WHERE l.id(+) = d.loc_id',
+    expectSuccess: false,
+    errorContains: 'JOIN を書いた SELECT では使えません',
+  },
+  {
+    name: 'Oracle: JOIN を使う SELECT の中でも、サブクエリの (+) は別の問い合わせとして読む',
+    category: 'oracle',
+    sql: 'SELECT e.id FROM emp e JOIN dept d ON d.id = e.dept_id WHERE EXISTS (SELECT 1 FROM loc l, area a WHERE l.area_id = a.id(+) AND l.id = d.loc_id)',
+    expectSuccess: true,
+  },
+  {
+    // ORA-01468: a predicate may reference only one outer-joined table
+    name: 'Oracle: 1 つの条件の両側に (+) を付けると、エラーにする',
+    category: 'error',
+    sql: 'SELECT e.id FROM emp e, dept d WHERE e.dept_id(+) = d.id(+)',
+    expectSuccess: false,
+    errorContains: '2 つの表（e、d）に付けています',
+  },
+  {
+    name: 'Oracle: SQL の最後の (+) も、結合条件の範囲に入れる',
+    category: 'oracle',
+    sql: 'SELECT * FROM emp e, dept d, loc l WHERE e.dept_id = d.id(+) AND d.loc_id = l.id (+)',
+    expectSuccess: true,
+    assert: (q) => {
+      const sql = 'SELECT * FROM emp e, dept d, loc l WHERE e.dept_id = d.id(+) AND d.loc_id = l.id (+)';
+      const texts = q.joins.map((j) => (j.sourceSpan ? sql.slice(j.sourceSpan.start, j.sourceSpan.end) : ''));
+      if (texts.join(' | ') !== 'e.dept_id = d.id(+) | d.loc_id = l.id (+)') throw new Error(texts.join(' | '));
+    },
   },
   {
     name: 'Oracle: (+) の結合とは別に、OR の条件を括弧で囲んだ WHERE は読む',

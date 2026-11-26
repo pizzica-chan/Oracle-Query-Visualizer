@@ -8,8 +8,9 @@ import { Parser } from 'node-sql-parser/build/mysql';
 import { normalizeConditionTree } from './condition-tree-normalize';
 import { NO_JOIN_CONDITION, formatJoinConditionLabel } from './join-condition';
 import { fixLogicalOperatorPrecedence } from './logical-precedence';
-import { displayIdentifier, findUnclosedLiteral, isWordChar, readBalancedParenEnd } from './sql-lex';
+import { displayIdentifier, findUnclosedLiteral, isWordChar, maskLiteralsAndComments, readBalancedParenEnd } from './sql-lex';
 import {
+  extendParsedQuerySpansOverOuterJoinMarks,
   maskNonCode,
   preprocessSqlForParser,
   remapParsedQuerySpansWithRemovedClauses,
@@ -1875,13 +1876,38 @@ function countSetOperatorsInAst(node: any, seen: Set<unknown> = new Set()): numb
   return count;
 }
 
+/** SET の値が、2 列以上を返すサブクエリそのものなら、その列の数 */
+function multiColumnSubqueryWidth(value: any): number {
+  const inner = value?.type === 'subquery' ? (value.subquery?.ast ?? value.subquery) : value?.ast;
+  if (inner?.type !== 'select') return 0;
+  const width = toArray<any>(inner.columns).length;
+  return width > 1 ? width : 0;
+}
+
 function parseSetClauses(set: any[]): SetClause[] {
   if (!set || set.length === 0) return [];
 
-  return set.map((entry) => {
+  // 前処理は `SET (a, b) = (SELECT x, y …)` を `SET a = (SELECT x, y …), b = (SELECT x, y …)` に展開する
+  // （expandMultiColumnUpdateSet）。そのまま書くと、どの列も 2 列のサブクエリ全体を代入するように読めるので、
+  // 何列目を代入するかを書く。同じサブクエリが列の数だけ続くものを、展開したものとみなす
+  const values = set.map((entry) => exprToString(entry.value));
+  const positions: number[] = set.map(() => 0);
+  for (let i = 0; i < set.length; ) {
+    const width = multiColumnSubqueryWidth(set[i].value);
+    let runEnd = i + 1;
+    while (width > 0 && runEnd < set.length && values[runEnd] === values[i] && multiColumnSubqueryWidth(set[runEnd].value) === width) {
+      runEnd += 1;
+    }
+    if (width > 0 && (runEnd - i) % width === 0) {
+      for (let k = i; k < runEnd; k++) positions[k] = ((k - i) % width) + 1;
+    }
+    i = runEnd;
+  }
+
+  return set.map((entry, index) => {
     const column = entry.column ?? '';
     const table = entry.table || undefined;
-    const value = exprToString(entry.value);
+    const value = positions[index] ? `${values[index]} の ${positions[index]} 列目` : values[index]!;
     const qualified = table ? `${table}.${column}` : column;
     return {
       column,
@@ -2097,10 +2123,13 @@ export function parseOracleQuery(sql: string): ParseResult {
       ...(preprocessResult.lockingClause ? [preprocessResult.lockingClause.sourceSpan] : []),
     ];
     const remap = (query: ParsedQuery) =>
-      trimParsedQuerySpanEnds(
-        shiftParsedQuerySpans(
-          remapParsedQuerySpansWithRemovedClauses(processedToOriginal, query, trimmed, removedClauseSpans),
-          leadingTrim,
+      extendParsedQuerySpansOverOuterJoinMarks(
+        trimParsedQuerySpanEnds(
+          shiftParsedQuerySpans(
+            remapParsedQuerySpansWithRemovedClauses(processedToOriginal, query, trimmed, removedClauseSpans),
+            leadingTrim,
+          ),
+          sql,
         ),
         sql,
       );
@@ -2196,18 +2225,56 @@ const OUTER_JOIN_MARK_RE = /\(\s*\+\s*\)/;
  * 旧式外部結合 (+) の制限に反する書き方をエラーにする（Oracle Database 23 SQL Language Reference「Joins」）。
  * - (+) を含む条件は、OR でほかの条件とつなげない
  * - (+) を付けた列を、IN で比べられない
- * そのまま解析すると、OR の下の結合条件を結合として拾えず、「直積」と説明してしまう
+ * - (+) は、FROM 句に JOIN の構文（JOIN … ON、CROSS JOIN、NATURAL JOIN など）がある問い合わせでは使えない（ORA-25156）
+ * - 1 つの条件で (+) を付けられるのは 1 つの表だけ（`e.id(+) = d.id(+)` は ORA-01468）
+ * そのまま解析すると、OR の下の結合条件を結合として拾えず、「直積」と説明してしまう。
+ * JOIN の構文と混ぜたものや両側に付けたものは、Oracle では動かない SQL を、内部結合や片側の外部結合として説明してしまう
  */
 function outerJoinRestrictionResult(query: ParsedQuery, sql: string): ParseResult {
   const masked = maskNonCode(sql);
+  // 表の名前を読むときは、引用識別子（"E E"）を伏せない
+  const withNames = maskLiteralsAndComments(sql);
   const errorAt = (start: number, end: number, message: string): ParseResult => {
     const at = lineColumnAt(sql, start);
     return { success: false, error: { message: `${at.line} 行 ${at.column} 列の${message}`, position: start, span: { start, end } } };
+  };
+  /** 条件の範囲の中で、最初の (+) の位置 */
+  const markIn = (node: ConditionNode): SourceSpan | undefined => {
+    if (!node.sourceSpan) return undefined;
+    const inside = OUTER_JOIN_MARK_RE.exec(masked.slice(node.sourceSpan.start, node.sourceSpan.end));
+    if (!inside) return undefined;
+    const start = node.sourceSpan.start + inside.index;
+    return { start, end: start + inside[0].length };
   };
   const inMatch = /\(\s*\+\s*\)\s*(?:NOT\s+)?IN\b/i.exec(masked);
   if (inMatch) {
     const mark = OUTER_JOIN_MARK_RE.exec(inMatch[0])!;
     return errorAt(inMatch.index, inMatch.index + mark[0].length, '「(+)」を付けた列は IN で比べられません。外部結合は LEFT JOIN … ON で書いてください');
+  }
+  for (const block of queryBlocksOf(query)) {
+    const marked = blockConditions(block).filter((node) => node.outerJoinSide);
+    for (const node of marked) {
+      const tables = outerJoinMarkedQualifiers(withNames, node.sourceSpan);
+      if (tables.length >= 2) {
+        const span = markIn(node) ?? node.sourceSpan!;
+        return errorAt(
+          span.start,
+          span.end,
+          `条件で「(+)」を 2 つの表（${tables.join('、')}）に付けています。NULL で埋める側の表 1 つだけに付けてください`,
+        );
+      }
+    }
+    const firstMarked = marked[0];
+    if (firstMarked && block.joins.some((join) => !join.fromWhereClause)) {
+      const span = markIn(firstMarked) ?? firstMarked.sourceSpan;
+      if (span) {
+        return errorAt(
+          span.start,
+          span.end,
+          '「(+)」は、FROM 句に JOIN を書いた SELECT では使えません。外部結合は LEFT JOIN … ON で書いてください',
+        );
+      }
+    }
   }
   const underOr = findOuterJoinUnderOr(query);
   if (underOr?.sourceSpan) {
@@ -2242,6 +2309,67 @@ function findOuterJoinUnderOr(query: ParsedQuery): ConditionNode | undefined {
     q.ctes?.map((c) => inQuery(c.query)).find(Boolean) ??
     q.embeddedSubqueries?.map(inQuery).find(Boolean);
   return inQuery(query);
+}
+
+/**
+ * 解析結果に含まれる問い合わせのブロック（SELECT の 1 つずつ）。派生テーブル・サブクエリ・UNION のブランチ・WITH の中までたどる。
+ * 再帰的な WITH は、自分を参照する表が自分の定義を持つので、一度たどったものは飛ばす
+ */
+function queryBlocksOf(query: ParsedQuery): ParsedQuery[] {
+  const blocks: ParsedQuery[] = [];
+  const seen = new Set<ParsedQuery>();
+  const visitCondition = (node: ConditionNode | undefined): void => {
+    if (!node) return;
+    node.children?.forEach(visitCondition);
+    if (node.nestedQuery) visitQuery(node.nestedQuery);
+  };
+  const visitQuery = (q: ParsedQuery): void => {
+    if (seen.has(q)) return;
+    seen.add(q);
+    blocks.push(q);
+    visitCondition(q.where);
+    visitCondition(q.having);
+    q.joins.forEach((join) => visitCondition(join.conditionRoot));
+    q.tables.forEach((table) => table.derivedQuery && visitQuery(table.derivedQuery));
+    q.unionBranches?.forEach((branch) => visitQuery(branch.query));
+    q.ctes?.forEach((cte) => visitQuery(cte.query));
+    q.embeddedSubqueries?.forEach(visitQuery);
+  };
+  visitQuery(query);
+  return blocks;
+}
+
+/** 1 つの問い合わせのブロックの条件（WHERE・HAVING・JOIN の ON）。サブクエリの中は別のブロックなので含めない */
+function blockConditions(query: ParsedQuery): ConditionNode[] {
+  const nodes: ConditionNode[] = [];
+  const seen = new Set<ConditionNode>();
+  const visit = (node: ConditionNode | undefined): void => {
+    if (!node || seen.has(node)) return;
+    seen.add(node);
+    nodes.push(node);
+    node.children?.forEach(visit);
+  };
+  visit(query.where);
+  visit(query.having);
+  query.joins.forEach((join) => visit(join.conditionRoot));
+  return nodes;
+}
+
+/** `e.id(+)` のように (+) を付けた列の表（別名）を、範囲の中から重複なしで集める。表の分からない列（`id(+)`）は数えない */
+function outerJoinMarkedQualifiers(sqlWithNames: string, span: SourceSpan | undefined): string[] {
+  if (!span) return [];
+  const text = sqlWithNames.slice(span.start, span.end);
+  const re = new RegExp(
+    String.raw`(?<![\p{L}\p{N}\p{M}_$#"])(${NAME_PART_SOURCE})\s*\.\s*${NAME_PART_SOURCE}\s*\(\s*\+\s*\)`,
+    'gu',
+  );
+  const found = new Map<string, string>();
+  for (const match of text.matchAll(re)) {
+    const name = match[1]!;
+    const key = unquoteNamePart(name).toUpperCase();
+    if (!found.has(key)) found.set(key, name);
+  }
+  return [...found.values()];
 }
 
 /** span の始まりが語（識別子・キーワード）の文字なら、終わりを語の終わりまで広げる */

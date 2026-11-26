@@ -1011,7 +1011,12 @@ function expandMultiColumnUpdateSet(state: ProcessState): void {
         continue;
       }
       const valueStart = skipMaskedWhitespace(masked, afterList + 1);
-      if (masked[valueStart] !== '(') {
+      // 列の並びは SET の直後か `,` の後ろにある（値の中の `CASE WHEN (x, y) = (SELECT …)` は比較なので展開しない）。
+      // 値はサブクエリに限る（構文図 update_set_clause: `( column [, column ]... ) = ( subquery )`）
+      const beforeList = masked.slice(setStart + 'SET'.length, i).trimEnd();
+      const startsItem = beforeList.length === 0 || beforeList.endsWith(',');
+      const valueWord = readWord(masked, skipMaskedWhitespace(masked, valueStart + 1))?.word.toUpperCase();
+      if (masked[valueStart] !== '(' || !startsItem || (valueWord !== 'SELECT' && valueWord !== 'WITH')) {
         i = listEnd;
         continue;
       }
@@ -1025,7 +1030,8 @@ function expandMultiColumnUpdateSet(state: ProcessState): void {
         if (text) columns.push({ text, start: cursor + raw.length - raw.trimStart().length });
         cursor += raw.length + 1;
       }
-      if (columns.length > 1) {
+      // 1 列だけを括弧で囲んだ `SET (a) = (SELECT x …)` も、`SET a = (SELECT x …)` に直す
+      if (columns.length >= 1) {
         // 複製した副問合せの文字は、元の副問合せの同じ文字の位置に対応させる。置き換える範囲の中へ順に配ると、
         // 2 つ目以降の複製の中の範囲（式の中のサブクエリの列など）が、元の SQL の別の場所を指す
         const orig = (pos: number): number => state.processedToOriginal[pos] ?? pos;
@@ -1648,6 +1654,21 @@ export function trimParsedQuerySpanEnds(query: ParsedQuery, sql: string): Parsed
   visitSpans(query, (span) => {
     const end = trimEnd(span.start, span.end);
     return end === span.end ? span : { start: span.start, end };
+  });
+  return query;
+}
+
+/**
+ * 範囲の直後に旧式外部結合の `(+)` があれば、範囲をその `)` まで広げる。sql は範囲の座標の基準になっている SQL。
+ * 前処理は `(+)` を空白に置き換えるので、式の位置（loc）は、後ろに別の語が続くときだけ `(+)` の空白まで延びる。
+ * SQL の最後の `d.id(+)` では延びないので、条件の範囲から `(+)` が抜ける（途中にあるときと範囲がそろわない）
+ */
+export function extendParsedQuerySpansOverOuterJoinMarks(query: ParsedQuery, sql: string): ParsedQuery {
+  const masked = maskNonCode(sql);
+  const mark = /\s*\(\s*\+\s*\)/y;
+  visitSpans(query, (span) => {
+    mark.lastIndex = span.end;
+    return mark.test(masked) ? { start: span.start, end: mark.lastIndex } : span;
   });
   return query;
 }
