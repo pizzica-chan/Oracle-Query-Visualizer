@@ -27,7 +27,8 @@ describe('構文エラーの位置', () => {
   });
 
   it('文の途中で入力が終わったときは、最後の空白でない 1 文字を範囲にする', () => {
-    const sql = 'SELECT a FROM t WHERE   \n';
+    // WHERE で終わる形は、条件の書き忘れとして別の文を返すので、比較演算子で終わる形で確かめる
+    const sql = 'SELECT a FROM t WHERE a =   \n';
     const error = errorOf(sql);
     const contentEnd = sql.trimEnd().length;
     expect(error.span).toEqual({ start: contentEnd - 1, end: contentEnd });
@@ -53,8 +54,8 @@ describe('構文エラーの文', () => {
   });
 
   it('入力の途中で終わったときは、そのことを書く', () => {
-    const error = errorOf('SELECT * FROM t WHERE');
-    expect(error.message).toBe('1 行 21 列で構文を解釈できません（SQL が途中で終わっています）');
+    const error = errorOf('SELECT * FROM t WHERE a =');
+    expect(error.message).toBe('1 行 25 列で構文を解釈できません（SQL が途中で終わっています）');
     expect(error.detail).toContain('end of input');
   });
 
@@ -101,7 +102,7 @@ describe('構文エラーの文', () => {
   });
 
   it('文字列の中の全角の空白と、閉じた文字列・代替引用符の中の引用符は原因にしない', () => {
-    const sql = "SELECT a FROM t WHERE s = 'あ　い' AND t = 'it''s' AND u = q'[it's]' AND";
+    const sql = "SELECT a FROM t WHERE s = 'あ　い' AND t = 'it''s' AND u = q'[it's]' AND v =";
     expect(errorOf(sql).message).toContain('SQL が途中で終わっています');
   });
 
@@ -123,5 +124,29 @@ describe('lineColumnAt', () => {
   it('1 始まりの行と列を返す', () => {
     expect(lineColumnAt('abc\ndef', 0)).toEqual({ line: 1, column: 1 });
     expect(lineColumnAt('abc\ndef', 5)).toEqual({ line: 2, column: 2 });
+  });
+});
+
+describe('書き忘れの原因が分かるエラー', () => {
+  it.each([
+    ['SELECT a.x FROM a WHERE (a.x = 1', '1 行 25 列の「(」が閉じていません', '('],
+    ['SELECT a.x FROM a WHERE a.x = 1)', '1 行 32 列の「)」に対応する「(」がありません', ')'],
+    ['SELECT a.x FROM a WHERE AND a.y = 1', '1 行 19 列の「WHERE」の後ろに条件がありません', 'WHERE'],
+    ['SELECT a.x FROM a WHERE a.x = 1 AND', '1 行 33 列の「AND」の後ろに条件がありません', 'AND'],
+    ['SELECT a.x FROM a JOIN b ON WHERE a.id = 1', '1 行 26 列の「ON」の後ろに条件がありません', 'ON'],
+    ['SELECT a.x, COUNT(*) FROM a GROUP BY a.x,', '1 行 41 列の「,」の後ろに項目がありません。余分な「,」を消してください', ','],
+    ['SELECT a.x FROM WHERE a.x = 1', '1 行 12 列の「FROM」の後ろにテーブルがありません', 'FROM'],
+    ['SELECT a.x FROM a WHERE a.x IN ()', '1 行 29 列の「IN ( )」の括弧の中に値がありません', 'IN ()'],
+    ['UPDATE a SET WHERE a.x = 1', '1 行 10 列の「SET」の後ろに、更新する列と値がありません', 'SET'],
+    ['SELECT a.x FROM a WHERE a.x = 1 GROUP a.x', '1 行 33 列の「GROUP」の後ろに BY がありません', 'GROUP'],
+  ])('%s', (sql, message, spanText) => {
+    const error = errorOf(sql);
+    expect(error.message).toBe(message);
+    expect(sql.slice(error.span!.start, error.span!.end)).toBe(spanText);
+  });
+
+  it('エラーの位置から離れた書き方は、原因にしない', () => {
+    // GROUP BY の「,」はエラーの位置（末尾の =）から離れているので、原因にしない
+    expect(errorOf('SELECT a.x FROM a GROUP BY a.x, a.y HAVING a.x =').message).toContain('SQL が途中で終わっています');
   });
 });

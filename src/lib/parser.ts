@@ -1446,6 +1446,18 @@ function parseFromClause(from: any[]): FromClauseResult {
       condition = 'NATURAL JOIN';
     }
 
+    // Oracle の [INNER] JOIN と外部結合には ON か USING が要る。書けるのは CROSS JOIN と NATURAL JOIN だけ
+    // （Oracle Database 23 SQL Language Reference の構文図 inner_cross_join_clause / outer_join_clause）。
+    // 受け付けると、Oracle では動かない SQL を直積や結合条件の無い外部結合として説明してしまう
+    if (condition === NO_JOIN_CONDITION && joinType !== 'CROSS JOIN') {
+      const name = tableRef.alias ?? tableRef.table;
+      throw new Error(
+        joinType === 'INNER JOIN' || joinType === 'JOIN'
+          ? `「${name}」との JOIN に ON（結合条件）がありません。すべての組み合わせを作るなら CROSS JOIN と書いてください`
+          : `「${name}」との ${joinType} に ON（結合条件）がありません。ON か USING で結合条件を書いてください`,
+      );
+    }
+
     joins.push({
       id: nextId('join'),
       type: joinType,
@@ -2246,7 +2258,14 @@ function likelySyntaxErrorCause(
   }
   const masked = maskNonCode(sql);
   const index = masked.slice(0, errorStart + 1).search(FULL_WIDTH_SEPARATOR_RE);
-  if (index < 0) return missingSelectItemCause(sql, masked, errorStart) ?? nestedSetOperationCause(masked);
+  if (index < 0) {
+    return (
+      missingSelectItemCause(sql, masked, errorStart) ??
+      nestedSetOperationCause(masked) ??
+      missingOperandCause(sql, masked, errorStart) ??
+      unbalancedParenCause(sql, masked, errorStart, endedEarly)
+    );
+  }
   const ch = masked[index]!;
   const at = lineColumnAt(sql, index);
   const message =
@@ -2285,6 +2304,105 @@ function nestedSetOperationCause(masked: string): { message: string; span: Sourc
       message: '括弧の中で集合演算をまとめる書き方（(SELECT … MINUS SELECT …) INTERSECT SELECT …）には対応していません',
       span: { start: i, end },
     };
+  }
+  return null;
+}
+
+/**
+ * 括弧の数が合わないとき、閉じていない「(」か、対応する「(」の無い「)」。
+ * 対応する「(」の無い「)」は、パーサーがそこでエラーにしたときだけ原因とみなす
+ */
+function unbalancedParenCause(
+  sql: string,
+  masked: string,
+  errorStart: number,
+  endedEarly: boolean,
+): { message: string; span: SourceSpan } | null {
+  const opens: number[] = [];
+  for (let i = 0; i < masked.length; i++) {
+    if (masked[i] === '(') opens.push(i);
+    else if (masked[i] === ')') {
+      if (opens.length > 0) {
+        opens.pop();
+        continue;
+      }
+      if (i !== errorStart) return null;
+      const at = lineColumnAt(sql, i);
+      return {
+        message: `${at.line} 行 ${at.column} 列の「)」に対応する「(」がありません`,
+        span: { start: i, end: i + 1 },
+      };
+    }
+  }
+  if (!endedEarly || opens.length === 0) return null;
+  const open = opens[opens.length - 1]!;
+  const at = lineColumnAt(sql, open);
+  return { message: `${at.line} 行 ${at.column} 列の「(」が閉じていません`, span: { start: open, end: open + 1 } };
+}
+
+/** 後ろに来ると、前の語の項目や条件が抜けていると分かる語 */
+const CLAUSE_WORDS =
+  'AND|OR|WHERE|GROUP|ORDER|HAVING|FROM|JOIN|INNER|LEFT|RIGHT|FULL|CROSS|NATURAL|UNION|MINUS|INTERSECT|EXCEPT|FETCH|OFFSET|LIMIT|ON|SET';
+
+/**
+ * 項目や条件を書き忘れた形。パーサーは次の語を名前として読み、さらに後ろの語でエラーにするので、
+ * エラーの位置だけでは原因が分からない。エラーの位置がその形のすぐ後ろ（次の語まで）にあるときだけ原因とみなす
+ */
+const MISSING_OPERAND_RULES: Array<{ re: RegExp; message: (word: string) => string }> = [
+  {
+    // `GROUP BY a,` や `SET a = 1, WHERE`。`, FROM` は missingSelectItemCause が先に扱う
+    re: new RegExp(String.raw`,\s*(?=$|\)|\b(?:${CLAUSE_WORDS})\b)`, 'gi'),
+    message: () => '「,」の後ろに項目がありません。余分な「,」を消してください',
+  },
+  {
+    re: new RegExp(String.raw`\b(WHERE|AND|OR|ON|HAVING|NOT)\b\s*(?=$|\)|\b(?:${CLAUSE_WORDS})\b)`, 'gi'),
+    message: (word) => `「${word.toUpperCase()}」の後ろに条件がありません`,
+  },
+  {
+    re: new RegExp(String.raw`\bSET\b\s*(?=$|\b(?:WHERE)\b)`, 'gi'),
+    message: () => '「SET」の後ろに、更新する列と値がありません',
+  },
+  {
+    re: new RegExp(String.raw`\bFROM\b\s*(?=$|\b(?:${CLAUSE_WORDS})\b)`, 'gi'),
+    message: () => '「FROM」の後ろにテーブルがありません',
+  },
+  {
+    re: new RegExp(String.raw`\bBY\b\s*(?=$|\b(?:${CLAUSE_WORDS})\b)`, 'gi'),
+    message: () => '「BY」の後ろに項目がありません',
+  },
+  {
+    // `WITHIN GROUP (ORDER BY …)` の GROUP は BY を取らない
+    re: /(?<!\bWITHIN\s+)\b(GROUP|ORDER)\b(?!\s+(?:SIBLINGS\s+)?BY\b)/gi,
+    message: (word) => `「${word.toUpperCase()}」の後ろに BY がありません`,
+  },
+  {
+    re: /\bIN\s*\(\s*\)/gi,
+    message: () => '「IN ( )」の括弧の中に値がありません',
+  },
+];
+
+function missingOperandCause(
+  sql: string,
+  masked: string,
+  errorStart: number,
+): { message: string; span: SourceSpan } | null {
+  for (const { re, message } of MISSING_OPERAND_RULES) {
+    re.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(masked)) !== null) {
+      if (match.index > errorStart) break;
+      // 一致の後ろの語（エラーの原因になった語）の終わりと、その後ろの空白まで
+      let end = match.index + match[0].length;
+      end += /^(?:[\w$#]+|\))?/.exec(masked.slice(end))![0].length;
+      end += /^\s*/.exec(masked.slice(end))![0].length;
+      if (errorStart > end) continue;
+      const at = lineColumnAt(sql, match.index);
+      const word = (match[1] ?? match[0]).trim();
+      return {
+        message: `${at.line} 行 ${at.column} 列の${message(word)}`,
+        span: { start: match.index, end: match.index + Math.max(1, word.length) },
+      };
+    }
   }
   return null;
 }
