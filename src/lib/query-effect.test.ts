@@ -1319,6 +1319,26 @@ describe('ROWNUM の条件', () => {
     expect(sql.slice(line!.sourceSpan!.start, line!.sourceSpan!.end)).toBe(written);
   });
 
+  it('ORDER SIBLINGS BY は、階層の順を保って同じ親の行どうしを並べると書く', () => {
+    const text = (sql: string) => {
+      const result = parseOracleQuery(sql);
+      if (!result.success) throw new Error(result.error.message);
+      return buildQueryEffect(result.query, 'japanese').sections.flatMap((s) => s.lines ?? []).map((l) => l.text);
+    };
+    const tree = 'SELECT e.name FROM emp e START WITH e.mgr IS NULL CONNECT BY PRIOR e.id = e.mgr';
+    expect(text(`${tree} ORDER SIBLINGS BY e.name FETCH FIRST 5 ROWS ONLY`)).toContain(
+      '並び順（ORDER SIBLINGS BY） — 階層の順を保ったまま、同じ親を持つ行どうしを e.name の順に並べる',
+    );
+    expect(text(`${tree} ORDER BY e.name`)).toContain(
+      '並び順 — e.name（階層問い合わせの階層の順は、この並び順で置き換わる。階層の順を保つなら ORDER SIBLINGS BY を使う）',
+    );
+    // 外側の ORDER BY は、インラインビューの中の ORDER SIBLINGS BY と別のもの
+    const nested = parseOracleQuery(`SELECT * FROM (${tree} ORDER SIBLINGS BY e.name) v ORDER BY v.name`);
+    if (!nested.success) throw new Error(nested.error.message);
+    expect(nested.query.orderSiblingsSpan).toBeUndefined();
+    expect(nested.query.tables[0]?.derivedQuery?.orderSiblingsSpan).toBeDefined();
+  });
+
   it('インラインビューの中の表の SAMPLE は、その中の表に持たせる', () => {
     const result = parseOracleQuery('SELECT * FROM (SELECT * FROM emp SAMPLE (5)) v, dept d');
     expect(result.success).toBe(true);

@@ -34,6 +34,8 @@ export interface CastTypeInfo extends ProcessedAnchor {
 export interface AggregateClauseInfo extends ProcessedAnchor {
   /** 元の SQL の書き方（連続する空白は 1 つにまとめる） */
   text: string;
+  /** 元 SQL 上の範囲 */
+  sourceSpan: SourceSpan;
 }
 
 /** 旧式外部結合演算子 `(+)` */
@@ -99,6 +101,8 @@ export interface PreprocessResult {
   sql: string;
   /** 取り除いた、表の後ろの指定。parser.ts が直前の表に持たせる */
   tableModifiers: TableModifierInfo[];
+  /** 取り除いた `ORDER SIBLINGS BY` の SIBLINGS（元 SQL の座標）。parser.ts がその ORDER BY の SELECT に持たせる */
+  orderSiblingsSpans: SourceSpan[];
   naturalJoinStarts: number[];
   outerJoinMarkers: OuterJoinMarker[];
   hierarchicalClauses: HierarchicalClauseInfo[];
@@ -115,6 +119,11 @@ export interface PreprocessResult {
   rangeFrameStarts: number[];
   /** preprocessed[i] の文字が元 SQL のどの位置か */
   processedToOriginal: number[];
+  /**
+   * 空白に置き換えた元 SQL の範囲。どれも、ほかのフィールド（outerJoinMarkers・hierarchicalClauses など）に記録してある
+   * （preprocess-removed.test.ts）。黙って取り除くと、SQL の作用が作用説明から消える
+   */
+  blankedSpans: SourceSpan[];
   /** 前処理で置き換えた関数名（大文字の仮の名前 → 元の名前）。表示では元の名前に戻す */
   renamedFunctions: Map<string, string>;
 }
@@ -126,6 +135,8 @@ interface ProcessState {
   anchors: ProcessedAnchor[];
   /** 同じく補正対象の生オフセット配列 */
   offsetLists: number[][];
+  /** blankOut で空白にした範囲（元 SQL の座標） */
+  blankedSpans: SourceSpan[];
 }
 
 function initState(sql: string): ProcessState {
@@ -134,6 +145,7 @@ function initState(sql: string): ProcessState {
     processedToOriginal: Array.from({ length: sql.length }, (_, index) => index),
     anchors: [],
     offsetLists: [],
+    blankedSpans: [],
   };
 }
 
@@ -202,6 +214,8 @@ function spliceProcessed(
 /** 同じ長さの空白へ置き換える。位置対応表が変わらないので記録済み位置の補正が不要 */
 function blankOut(state: ProcessState, start: number, end: number): void {
   if (end <= start) return;
+  // 空白にした元 SQL の範囲を残す。取り除いたものをすべて記録しているかを preprocess-removed.test.ts が確かめる
+  state.blankedSpans.push(originalSpanForProcessedRange(state, start, end));
   state.sql = state.sql.slice(0, start) + ' '.repeat(end - start) + state.sql.slice(end);
 }
 
@@ -804,9 +818,10 @@ function forUpdateRanges(masked: string): Array<{ start: number; end: number }> 
 function stripNonStructuralClauses(
   state: ProcessState,
   sql: string,
-): { lockingClause?: LockingClauseInfo; tableModifiers: TableModifierInfo[] } {
+): { lockingClause?: LockingClauseInfo; tableModifiers: TableModifierInfo[]; orderSiblingsSpans: SourceSpan[] } {
   const masked = maskNonCode(state.sql);
   const forUpdate = forUpdateRanges(masked);
+  const siblings = matchRanges(masked, ORDER_SIBLINGS_RE, 1);
   const modifierRanges: Array<{ kind: TableModifierInfo['kind']; range: { start: number; end: number } }> = [
     ...matchRangesWithParen(masked, TABLE_PARTITION_RE).map((range) => ({ kind: 'partition' as const, range })),
     ...sampleRanges(masked).map((range) => ({ kind: 'sample' as const, range })),
@@ -822,14 +837,12 @@ function stripNonStructuralClauses(
   const tableModifiers = modifierRanges
     .map(({ kind, range }) => ({ kind, ...written(range) }))
     .sort((a, b) => a.sourceSpan.start - b.sourceSpan.start);
-  blankRanges(state, [
-    ...matchRanges(masked, ORDER_SIBLINGS_RE, 1),
-    ...modifierRanges.map(({ range }) => range),
-    ...forUpdate,
-  ]);
+  // ORDER SIBLINGS BY は、ORDER BY と違って階層の順を保つので、SIBLINGS の位置を記録して作用説明に出す
+  const orderSiblingsSpans = siblings.map((range) => written(range).sourceSpan);
+  blankRanges(state, [...siblings, ...modifierRanges.map(({ range }) => range), ...forUpdate]);
   // 行ロックの指定は結果の行を変えないが、行をロックする作用なので、取り除く前の書き方を記録して作用説明に出す
   const last = forUpdate[forUpdate.length - 1];
-  return { lockingClause: last ? written(last) : undefined, tableModifiers };
+  return { lockingClause: last ? written(last) : undefined, tableModifiers, orderSiblingsSpans };
 }
 
 /** `SAMPLE (10)` に続く `SEED (1)` も同じ指定に含める */
@@ -898,7 +911,11 @@ function stripTrailingFunctionClauses(state: ProcessState, sql: string): Aggrega
     for (const range of ranges) {
       // 元の SQL から取る。前処理の途中の SQL では、中の NULLS FIRST / LAST などが空白になっている
       const original = originalSpanForProcessedRange(state, range.start, range.end);
-      records.push({ processedPos: range.start, text: sql.slice(original.start, original.end).replace(/\s+/g, ' ') });
+      records.push({
+        processedPos: range.start,
+        text: sql.slice(original.start, original.end).replace(/\s+/g, ' '),
+        sourceSpan: original,
+      });
     }
     for (const range of ranges.reverse()) blankOut(state, range.start, range.end);
   }
@@ -1419,7 +1436,7 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
   const nullsOrders = collectNullsOrders(state);
   state.anchors.push(...nullsOrders);
 
-  const { lockingClause, tableModifiers } = stripNonStructuralClauses(state, sql);
+  const { lockingClause, tableModifiers, orderSiblingsSpans } = stripNonStructuralClauses(state, sql);
   const aggregateClauses = stripTrailingFunctionClauses(state, sql);
   state.anchors.push(...aggregateClauses);
   const rangeFrameStarts = rewriteRangeFrames(state);
@@ -1464,7 +1481,9 @@ export function preprocessSqlForParser(sql: string): PreprocessResult {
     rangeFrameStarts,
     lockingClause,
     tableModifiers,
+    orderSiblingsSpans,
     processedToOriginal: state.processedToOriginal,
+    blankedSpans: state.blankedSpans,
     renamedFunctions,
   };
 }

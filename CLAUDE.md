@@ -47,6 +47,8 @@ src/lib/fixtures/ 全テストが共有する SQL ケース集と不変条件ア
   → remapParsedQuerySpans で全 sourceSpan を元 SQL の座標へ戻し、
     shiftParsedQuerySpans で先頭の空白の分ずらし、trimParsedQuerySpanEnds で範囲の後ろの空白とコメントを除き、
     extendParsedQuerySpansOverOuterJoinMarks で直後の (+) を範囲に入れる
+  → attachTableModifiers・attachOrderSiblings で、前処理で記録した表の後ろの指定（SAMPLE・PARTITION・AS OF・@dblink）と
+    ORDER SIBLINGS BY を、その表と SELECT に持たせる
 ```
 
 ## パーサ選定の経緯（変更前に必ず読む）
@@ -59,13 +61,29 @@ node-sql-parser に **Oracle 専用ビルドは無い**。全方言を実測し�
 
 方言を変えたくなったら、まず `loc` が返るかを確認すること。返らない方言に替えると UI の中核が静かに壊れる。
 
+## 変更を報告する前に確かめること
+
+これまでの不具合の多くは、次のどれかを確かめずに直したことから出ている。直したら、報告する前に 1 つずつ確かめる。
+
+1. **Oracle で書ける SQL か**。構文図（文章版は `img_text/<名前>.html`）だけでなく、その構文の説明にある制限（Restrictions）の節も読む。書けない形はエラーにする（`JOIN … ON` と同じ SELECT の `(+)` や、両側に付けた `(+)` を受け付けていた）。ケース集に `expectSuccess: true` で足す SQL も、Oracle で動くかを確かめる。
+2. **前処理で取り除いたものを、作用説明から消していないか**。取り除く句は、記録して作用説明に出す。出さずにおくのは、結果の行も SQL の作用も変えないものだけにして、理由をコメントに書く。`preprocess-removed.test.ts` が、空白にした範囲がすべて記録されていることを確かめている（`SAMPLE`・`PARTITION`・`AS OF` と、`ORDER SIBLINGS BY` の SIBLINGS を黙って取り除き、表の全部の行を読む、結果全体を並べ替える、と説明していた）。
+3. **SQL を渡して確かめたか**。作用説明のテストは、`ParsedQuery` を手で組み立てずに、`parseOracleQuery` に SQL を渡して書く。説明の文を用意しても、パーサーがその SQL を読めず、文まで届かないことがある。
+4. **同じ仕組みの、別の形でも試したか**。1 つの形で直したら、次の形も試す。
+   - 演算子: `=`・`<`・`<>` と、左右を入れ替えた形（`ROWNUM > 1` だけを直し、`ROWNUM = 2` と `1 > ROWNUM` を見落としていた）
+   - 結合: INNER・LEFT・RIGHT・FULL・CROSS・NATURAL・カンマ結合・`(+)`（FULL JOIN だけ「レコード必須」の分け方を誤っていた）
+   - 位置: SQL の途中と最後、サブクエリとインラインビューの中、UNION のブランチ（SQL の最後の `(+)` だけが範囲から抜けていた）
+   - 文: SELECT・UPDATE・DELETE
+5. **エラー文が、正しい SQL を直すように案内していないか**。Oracle で書けるのに読めない構文は、parser.ts の `UNSUPPORTED_SYNTAX` に足して、未対応と書く（`LISTAGG … ON OVERFLOW` に「余分な「,」を消してください」と出ていた）。
+6. **MySQL 版も確かめたか**（下の「MySQL 版と同じ作りのファイルが多い」）。説明の文を持ってくるときは、その方言の公式のリファレンスで意味を確かめる（`FOR UPDATE OF` の後ろに書くのは、Oracle では列、MySQL では表）。
+7. **足したテストが、直す前のコードで失敗するか**（下の「テストや `npm run check:browser` の確認項目を足したら」）。
+
 ## 変更時に踏みやすい落とし穴
 
 - **node-sql-parser は WHERE・ON・HAVING の中で AND と OR を同じ優先順位として左から結び付ける**（`a OR b AND c` が `(a OR b) AND c` になる）。`parseOracleQuery` が `astify` の直後に `logical-precedence.ts` で組み直している。AST を自分で `astify` する経路を足すときも、この組み直しを通す。Oracle の `||` は文字列の連結なので、論理演算として扱わない（パーサーは比較より強く結び付け、連結として正しく読む）。
 
 - **`parser.ts` はモジュールレベルの可変状態を持つ**（`nodeCounter` / `naturalJoinStarts` / `outerJoinMarkers` / `hierarchicalClauses` / `rowLimits` / `optimizerHints` / `nullsOrders` / `processedSql` / `castTypes` / `aggregateClauses` / `rangeFrameStarts` / `renamedFunctions` / `embeddedSubqueryAsts` / `maskedProcessed` / `maskedProcessedFor`）。`parseOracleQuery` の先頭の `resetIds()` で毎回全消しする前提なので、解析を並行化したり再入させたりすると壊れる。変数を足したら、`resetIds()` とこの一覧の両方に足す。
 
-- **前処理で取り除いた句は空白に置き換わり、AST の `loc` 範囲の外に出る**。どの SELECT に属するかは `recordsOwnedBySelect()` が「SELECT の範囲 + 後続の空白」で判定している。`selectRange()` の空白ぶんの延長を外すと、`FETCH FIRST` や `CONNECT BY` が末尾のクエリから外れて拾われなくなる。式の位置（`loc`）も後ろの空白まで延びるので、取り除いた句の後ろに別の句が続くと、元の SQL の位置に戻したときに、式の範囲が取り除いた句まで入る（`WHERE a = 1 START WITH … CONNECT BY … ORDER SIBLINGS BY …` の `a = 1`）。`remapParsedQuerySpansWithRemovedClauses` が句の始まりで切っているので、新しく句を取り除くときは、その範囲を parser.ts の `removedClauseSpans` に足す。テストは取り除いた句の後ろに別の句が続く形で書く（句で終わる SQL では起きない）。
+- **前処理で取り除いた句は空白に置き換わり、AST の `loc` 範囲の外に出る**。どの SELECT に属するかは `recordsOwnedBySelect()` が「SELECT の範囲 + 後続の空白」で判定している。`selectRange()` の空白ぶんの延長を外すと、`FETCH FIRST` や `CONNECT BY` が末尾のクエリから外れて拾われなくなる。式の位置（`loc`）も後ろの空白まで延びるので、取り除いた句の後ろに別の句が続くと、元の SQL の位置に戻したときに、式の範囲が取り除いた句まで入る（`WHERE a = 1 START WITH … CONNECT BY … ORDER SIBLINGS BY …` の `a = 1`）。`remapParsedQuerySpansWithRemovedClauses` が句の始まりで切っているので、新しく句を取り除くときは、その範囲を parser.ts の `removedClauseSpans` に足す。空白に置き換えるのは `blankOut()` だけにする（空白にした範囲を `blankedSpans` に残し、`preprocess-removed.test.ts` が記録と照らし合わせる）。テストは取り除いた句の後ろに別の句が続く形で書く（句で終わる SQL では起きない）。
 
 - **長さを変えない書き換えを優先する**。`(+)` → 空白、`"Name"` → 別の引用記号、ヒントの `+` → 空白、ウィンドウ枠の `RANGE` → `ROWS `（後ろに空白 1 つ）は、いずれも**同じ長さ**に置き換えているので位置対応表がずれない。長さが変わる書き換え（`q'[…]'`、`UNIQUE`→`DISTINCT`、CAST の型名、`DELETE` への `FROM` 補完、`SET a = DEFAULT` の引用、バックスラッシュの二重化、`SUM(DISTINCT a)` の括弧、`VARIANCE` の仮の名前、`#`・`$`・日本語を含む識別子の引用）は `spliceProcessed()` を通し、記録済みの位置を `adjustRecordedPositions()` で補正する。**長さの変わる書き換えを追加するなら、位置を記録する処理より後ろに置く**。
 
@@ -73,7 +91,7 @@ node-sql-parser に **Oracle 専用ビルドは無い**。全方言を実測し�
 
 - **カンマ結合の JOIN 化は AND 連結された最上位の条件だけ**（`collectAndedConditions`）。OR の下の条件を結合として拾うと、実際には直積になるクエリを内部結合として描いてしまう。
 
-- **SQL テキストを正規表現で走査するときは `maskNonCode()` を通す**。文字列リテラル・コメント・引用識別子の中身（例: `WHERE note = 'CONNECT BY x'`）を構文と誤読する。`maskNonCode` は長さを保つので、マスク後のオフセットは元テキストと一致する。ただし引用識別子も伏せるので、式の中の表の参照（`"E E".id`）を探すときは、引用識別子を残す `maskLiteralsAndComments()` を使う。
+- **SQL テキストを正規表現で走査するときは `maskNonCode()` を通す**。文字列リテラル・コメント・引用識別子の中身（例: `WHERE note = 'CONNECT BY x'`）を構文と誤読する。`maskNonCode` は長さを保つので、マスク後のオフセットは元テキストと一致する。ただし引用識別子も伏せるので、式の中の表の参照（`"E E".id`）を探すときは、引用識別子を残す `maskLiteralsAndComments()` を使う。書き換えるために構文を探すときは、見つけた位置がその構文を書ける場所かも確かめる（`SET (a, b) = (SELECT …)` を展開する処理が、値の中の比較 `CASE WHEN (x, y) = (SELECT …)` まで展開していた。SET の直後か `,` の後ろかを見る）。
 
 - **Oracle の字句規則は MySQL と違う**（`src/lib/sql-lex.ts`）。`--` は直後の空白を要求しない／`#` 行コメントは無い／`"` は文字列ではなく引用識別子／`\` はエスケープではない／`q'[…]'` がある。ここを MySQL の規則に戻すと前処理が静かに誤動作する。
 
@@ -105,7 +123,7 @@ node-sql-parser に **Oracle 専用ビルドは無い**。全方言を実測し�
 
 - **SQL パーサーは、文字列・数値・NULL・CASE 式・CAST・DUAL・FROM 句のサブクエリに位置（`loc`）を返さない**。列の範囲は `fillMissingColumnSpans`、インラインビューは `derivedTableSourceSpan`、DUAL は `fillDualSpan` で補い、CAST の元の型名は、位置で探せないときに書き換えたあとの型名で探している（いずれも parser.ts）。範囲や位置に頼る処理を足すときは、これらの形でもテストする。
 
-- **SQL パーサー（MySQL ビルド）は、Oracle では書けない SQL も受け付ける**（ON の無い `JOIN` など）。受け付けたまま説明すると、Oracle では動かない SQL の作用を見せてしまう。新しい書き方に対応するときは、SQL Language Reference の構文図（文章版は `img_text/<名前>.html`）で書けるかを確かめ、書けない形はエラーにする。
+- **SQL パーサー（MySQL ビルド）は、Oracle では書けない SQL も受け付ける**（ON の無い `JOIN`、`JOIN … ON` と同じ SELECT の `(+)` など）。受け付けたまま説明すると、Oracle では動かない SQL の作用を見せてしまう。新しい書き方に対応するときは、SQL Language Reference の構文図（文章版は `img_text/<名前>.html`）と、その構文の制限の節で書けるかを確かめ、書けない形はエラーにする。
 
 - **作用説明に、SQL の結果についての説明（NULL の扱い・ROWNUM・小計の行・行ロックなど）を足すときは、公式のリファレンスで確かめ、コードのコメントに出典を書く**。ページの文を文言どおりに確かめられないときは、確かめられた範囲だけを書き、コメントにもそう書く。
 

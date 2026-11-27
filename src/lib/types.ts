@@ -182,6 +182,8 @@ export interface ParsedQuery {
   lockingClauseSpan?: SourceSpan;
   /** 階層問い合わせ */
   hierarchical?: HierarchicalQuery;
+  /** `ORDER SIBLINGS BY` の SIBLINGS の位置。ORDER BY が、階層の順を保って同じ親の行どうしを並べる指定のとき */
+  orderSiblingsSpan?: SourceSpan;
   /** UNION / UNION ALL 等の各ブランチ（2本以上のとき） */
   unionBranches?: UnionBranch[];
   /** WITH 句で定義された CTE */

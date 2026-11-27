@@ -179,10 +179,17 @@ function describePostProcessLinesJapanese(query: ParsedQuery): EffectLine[] {
   const distinctLine = describeDistinctLineJapanese(query);
   if (distinctLine) lines.push({ text: distinctLine });
   if (query.orderBy.length > 0) {
-    lines.push({
-      text: `並び順 — ${query.orderBy.map((o) => o.text).join(', ')}`,
-      sourceSpan: query.orderBy[0]?.sourceSpan,
-    });
+    const items = query.orderBy.map((o) => o.text).join(', ');
+    // 階層問い合わせの ORDER BY は、CONNECT BY が作った階層の順を置き換える。階層の順を保つには ORDER SIBLINGS BY を使い、
+    // 同じ親の行どうしだけを並べる（Oracle Database 19c SQL Language Reference「Hierarchical Queries」: If you want to
+    // order rows of siblings of the same parent, then use the ORDER SIBLINGS BY clause / ORDER BY … will override the
+    // hierarchical order of the CONNECT BY results）
+    const text = query.orderSiblingsSpan
+      ? `並び順（ORDER SIBLINGS BY） — 階層の順を保ったまま、同じ親を持つ行どうしを ${items} の順に並べる`
+      : query.hierarchical
+        ? `並び順 — ${items}（階層問い合わせの階層の順は、この並び順で置き換わる。階層の順を保つなら ORDER SIBLINGS BY を使う）`
+        : `並び順 — ${items}`;
+    lines.push({ text, sourceSpan: query.orderBy[0]?.sourceSpan });
     // 同じ SELECT の ORDER BY は、ROWNUM で絞ったあとの行を並べ替える。並べ替えた結果の上位の行になるとは限らない
     // （Oracle Database 23 SQL Language Reference「ROWNUM Pseudocolumn」）
     if (whereHasRownum(query.where)) {

@@ -2133,8 +2133,12 @@ export function parseOracleQuery(sql: string): ParseResult {
       ...m,
       sourceSpan: { start: m.sourceSpan.start + leadingTrim, end: m.sourceSpan.end + leadingTrim },
     }));
+    const orderSiblingsSpans = preprocessResult.orderSiblingsSpans.map((span) => ({
+      start: span.start + leadingTrim,
+      end: span.end + leadingTrim,
+    }));
     const remap = (query: ParsedQuery) =>
-      attachTableModifiers(extendParsedQuerySpansOverOuterJoinMarks(
+      attachOrderSiblings(attachTableModifiers(extendParsedQuerySpansOverOuterJoinMarks(
         trimParsedQuerySpanEnds(
           shiftParsedQuerySpans(
             remapParsedQuerySpansWithRemovedClauses(processedToOriginal, query, trimmed, removedClauseSpans),
@@ -2143,7 +2147,7 @@ export function parseOracleQuery(sql: string): ParseResult {
           sql,
         ),
         sql,
-      ), tableModifiers);
+      ), tableModifiers), orderSiblingsSpans);
 
     if (first.type === 'select') {
       // `SELECT … UNION (SELECT …)` は右側のブランチがエラーにならずに AST から消えるか、別の形に化ける。
@@ -2370,6 +2374,25 @@ function attachTableModifiers(query: ParsedQuery, modifiers: TableModifier[]): P
       if (table.sourceSpan!.start !== best) continue;
       if (!table.modifiers?.includes(modifier)) table.modifiers = [...(table.modifiers ?? []), modifier];
     }
+  }
+  return query;
+}
+
+/**
+ * 取り除いた `ORDER SIBLINGS BY` の SIBLINGS を、その ORDER BY を持つ SELECT に持たせる。
+ * SIBLINGS の位置を範囲に含む問い合わせのブロックのうち、いちばん内側のもの（範囲がいちばん狭いもの）とする
+ */
+function attachOrderSiblings(query: ParsedQuery, spans: SourceSpan[]): ParsedQuery {
+  if (spans.length === 0) return query;
+  const blocks = queryBlocksOf(query).filter((block) => block.sourceSpan && block.orderBy.length > 0);
+  for (const span of spans) {
+    let owner: ParsedQuery | undefined;
+    for (const block of blocks) {
+      const s = block.sourceSpan!;
+      if (s.start > span.start || span.end > s.end) continue;
+      if (!owner || s.end - s.start < owner.sourceSpan!.end - owner.sourceSpan!.start) owner = block;
+    }
+    if (owner) owner.orderSiblingsSpan = span;
   }
   return query;
 }
