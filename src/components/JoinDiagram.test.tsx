@@ -109,6 +109,18 @@ describe('JoinDiagram', () => {
     expect(container.textContent).toContain('実質 INNER');
   });
 
+  it.each([
+    ['WHERE e.salary > 10', 'FULL JOIN ≈LEFT', '実質 LEFT JOIN'],
+    ['WHERE d.id > 1', 'FULL JOIN ≈RIGHT', '実質 RIGHT JOIN'],
+    ['WHERE e.salary > 10 AND d.id > 1', 'FULL JOIN ≈INNER', '実質 INNER JOIN'],
+  ])('FULL JOIN の %s は、JOIN 条件の欄にも作用説明と同じ実質の JOIN の種類を出す', (where, badge, tag) => {
+    const result = parseOracleQuery(`SELECT e.name FROM emp e FULL JOIN dept d ON d.id = e.dept_id ${where}`);
+    if (!result.success) throw new Error(result.error.message);
+    mount({ tables: result.query.tables, joins: result.query.joins, resolveAliases: false, query: result.query });
+    expect(container.querySelector('.join-type-badge')?.textContent).toBe(badge);
+    expect(container.querySelector('.join-effective-inner-tag')?.textContent).toBe(tag);
+  });
+
   it('同一 props の再描画で無限ループしない', () => {
     const result = parseOracleQuery(SAMPLE_SQL);
     expect(result.success).toBe(true);

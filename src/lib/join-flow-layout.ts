@@ -1,6 +1,6 @@
 import type { Edge, Node } from '@xyflow/react';
 import { MarkerType } from '@xyflow/react';
-import { effectiveInnerAnalysisByJoinId } from './join-effective-inner';
+import { effectiveJoinTypeByJoinId, effectiveJoinTypeMark } from './join-effective-inner';
 import { formatJoinDisplayType } from './parser';
 import type { JoinEdge, JoinType, ParsedQuery, SourceSpan, TableRef } from './types';
 import { joinConditionDisplayText } from './join-condition';
@@ -81,6 +81,8 @@ export interface JoinFlowEdgeData extends Record<string, unknown> {
   condition: string;
   joinType: string;
   effectiveInner?: boolean;
+  /** 実質の JOIN の種類の印（FULL JOIN の `≈LEFT` など）。実質 INNER JOIN は effectiveInner で表す */
+  effectiveMark?: string;
   compact?: boolean;
   /** エッジラベルの垂直オフセット方向（1 または -1） */
   labelOffsetFlip?: 1 | -1;
@@ -166,7 +168,7 @@ export function computeJoinLayoutKey(
   compact = false,
 ): string {
   const effectiveInnerKey = query
-    ? [...effectiveInnerAnalysisByJoinId(query).keys()].sort().join(',')
+    ? [...effectiveJoinTypeByJoinId(query)].map(([id, type]) => `${id}=${type}`).sort().join(',')
     : '';
   const tablesKey = tables.map(tableLayoutSignature).join('|');
   const joinsKey = joins.map(joinLayoutSignature).join('|');
@@ -252,7 +254,7 @@ export function buildJoinFlowLayout(
   query?: ParsedQuery,
   compact = false,
 ): { nodes: Node[]; edges: Edge[] } {
-  const effectiveInnerByJoinId = query ? effectiveInnerAnalysisByJoinId(query) : new Map();
+  const effectiveTypeByJoinId = query ? effectiveJoinTypeByJoinId(query) : new Map<string, JoinType>();
   const nodePositions = computeJoinNodePositions(tables, joins);
 
   const nodes: Node[] = tables.map((t) => {
@@ -280,9 +282,11 @@ export function buildJoinFlowLayout(
 
   const edges: Edge[] = [];
   joins.forEach((j, joinIndex) => {
-    const effectiveInner = isEffectiveInnerJoin(j.id, effectiveInnerByJoinId);
+    const effectiveType = effectiveTypeByJoinId.get(j.id);
+    const effectiveInner = effectiveType === 'INNER JOIN';
     const baseColor = JOIN_COLORS[j.type] ?? JOIN_EDGE_FALLBACK_COLOR;
-    const color = effectiveInner ? (JOIN_COLORS['INNER JOIN'] ?? baseColor) : baseColor;
+    const color = effectiveType ? (JOIN_COLORS[effectiveType] ?? baseColor) : baseColor;
+    const effectiveMark = effectiveType && !effectiveInner ? effectiveJoinTypeMark(effectiveType) : undefined;
     const sources = resolveJoinLayoutSources(j, tables);
     const anchorId = sources[sources.length - 1] ?? j.sourceId;
 
@@ -306,6 +310,7 @@ export function buildJoinFlowLayout(
           condition: joinConditionDisplayText(j.condition),
           joinType: formatJoinDisplayType(j),
           effectiveInner: isPrimary ? effectiveInner : false,
+          ...(isPrimary && effectiveMark ? { effectiveMark } : {}),
           compact,
           labelOffsetFlip: joinIndex % 2 === 0 ? 1 : -1,
           sourceSpan: j.sourceSpan,

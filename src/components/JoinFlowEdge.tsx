@@ -40,6 +40,7 @@ export function JoinFlowEdge({
   const color = (style?.stroke as string | undefined) ?? '#64748b';
   const typeLines = [edgeData.joinType ?? 'JOIN'];
   if (edgeData.effectiveInner) typeLines.push('≈INNER');
+  else if (edgeData.effectiveMark) typeLines.push(edgeData.effectiveMark);
   const condition = edgeData.condition?.trim() ?? '';
   const showCondition =
     edgeData.showGraphJoinCondition !== false &&
@@ -67,7 +68,7 @@ export function JoinFlowEdge({
     .filter(Boolean)
     .join(' ');
   const typeLabelClass = `join-edge-type-label${
-    edgeData.effectiveInner ? ' join-edge-type-label--effective-inner' : ''
+    edgeData.effectiveInner || edgeData.effectiveMark ? ' join-edge-type-label--effective-inner' : ''
   }${focusClass ? ` ${focusClass}` : ''}`;
   const labelColorStyle = { borderColor: color, color };
   const wrapEdgeLabelClick = (props: Record<string, unknown>) => ({

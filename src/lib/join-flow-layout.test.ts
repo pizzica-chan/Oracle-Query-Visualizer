@@ -26,6 +26,23 @@ describe('join-flow-layout', () => {
     },
   ];
 
+  it('WHERE で片側の NULL の行が除かれる FULL JOIN の線に、実質の JOIN の種類の印と色を付ける', () => {
+    const fullJoin = (where: string) => {
+      const result = parseOracleQuery(`SELECT e.name FROM emp e FULL JOIN dept d ON d.id = e.dept_id ${where}`);
+      if (!result.success) throw new Error(result.error.message);
+      const { edges } = buildJoinFlowLayout(result.query.tables, result.query.joins, false, result.query);
+      return edges[0]!;
+    };
+    const left = fullJoin('WHERE e.salary > 10');
+    expect(left.data?.effectiveMark).toBe('≈LEFT');
+    expect(left.data?.effectiveInner).toBe(false);
+    expect(fullJoin('WHERE d.id > 1').data?.effectiveMark).toBe('≈RIGHT');
+    expect(fullJoin('WHERE e.salary > 10 AND d.id > 1').data?.effectiveInner).toBe(true);
+    const plain = fullJoin('');
+    expect(plain.data?.effectiveMark).toBeUndefined();
+    expect(left.style?.stroke).not.toBe(plain.style?.stroke);
+  });
+
   it('computeJoinLayoutKey が同入力で同じキーを返す', () => {
     const a = computeJoinLayoutKey(sampleTables, sampleJoins, false);
     const b = computeJoinLayoutKey(sampleTables, sampleJoins, false);

@@ -17,7 +17,7 @@ import { SourceLinkContext, useSourceLink } from '../contexts/source-link-contex
 import { useJoinFlowState } from '../hooks/useJoinFlowState';
 import { useColorScheme } from '../hooks/useTheme';
 import { joinConditionDisplayText } from '../lib/join-condition';
-import { effectiveInnerAnalysisByJoinId } from '../lib/join-effective-inner';
+import { effectiveJoinTypeByJoinId, effectiveJoinTypeMark } from '../lib/join-effective-inner';
 import { formatJoinTableLink } from '../lib/join-graph-layout';
 import {
   computeJoinFocusHighlight,
@@ -42,7 +42,7 @@ import {
   type JoinFlowEdgeData,
 } from '../lib/join-flow-layout';
 import { sourceSelectableProps, toggleSourceSpan, type OnSourceSpanSelect } from '../lib/source-link';
-import type { JoinEdge, ParsedQuery, SourceSpan, TableRef } from '../lib/types';
+import type { JoinEdge, JoinType, ParsedQuery, SourceSpan, TableRef } from '../lib/types';
 
 /** fitView の実測待ちを諦めるまでのフレーム数（約 1 秒） */
 const FIT_MAX_ATTEMPTS = 60;
@@ -157,8 +157,8 @@ function JoinDiagramFlow({
   onSourceSpanSelect,
   isActive = true,
 }: JoinDiagramFlowProps) {
-  const effectiveInnerByJoin = query ? effectiveInnerAnalysisByJoinId(query) : new Map();
-  const hasEffectiveInner = effectiveInnerByJoin.size > 0;
+  const effectiveTypeByJoin = query ? effectiveJoinTypeByJoinId(query) : new Map<string, JoinType>();
+  const hasEffectiveInner = [...effectiveTypeByJoin.values()].includes('INNER JOIN');
   const [showGraphJoinConditions, setShowGraphJoinConditions] = useState(true);
   const [joinFocus, setJoinFocus] = useState<JoinDiagramFocus | null>(null);
 
@@ -406,9 +406,9 @@ function JoinDiagramFlow({
           <h3>JOIN 条件</h3>
           <ul>
             {joins.map((j) => {
-              const effectiveInner = effectiveInnerByJoin.has(j.id);
+              const effectiveType = effectiveTypeByJoin.get(j.id);
               const edgeColor = themedJoinColor(
-                effectiveInner ? JOIN_COLORS['INNER JOIN'] : JOIN_COLORS[j.type],
+                effectiveType ? JOIN_COLORS[effectiveType] : JOIN_COLORS[j.type],
                 colorScheme,
               );
               const conditionProps = onSourceSpanSelect
@@ -422,13 +422,13 @@ function JoinDiagramFlow({
               return (
                 <li key={j.id}>
                   <span
-                    className={`join-type-badge${effectiveInner ? ' join-type-badge--effective-inner' : ''}`}
+                    className={`join-type-badge${effectiveType ? ' join-type-badge--effective-inner' : ''}`}
                     style={{ borderColor: edgeColor, color: edgeColor }}
                   >
-                    {effectiveInner ? `${j.type} ≈INNER` : j.type}
+                    {effectiveType ? `${j.type} ${effectiveJoinTypeMark(effectiveType)}` : j.type}
                   </span>
-                  {effectiveInner && (
-                    <span className="join-effective-inner-tag">実質 INNER JOIN</span>
+                  {effectiveType && (
+                    <span className="join-effective-inner-tag">実質 {effectiveType}</span>
                   )}
                   <span className="join-tables">{formatJoinTableLink(j, tables)}</span>
                   <code {...conditionProps}>{joinConditionDisplayText(j.condition)}</code>

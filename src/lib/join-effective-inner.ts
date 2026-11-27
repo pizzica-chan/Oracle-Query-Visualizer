@@ -633,6 +633,27 @@ export function analyzeFullJoinNullRejection(query: ParsedQuery): Map<string, Fu
   return result;
 }
 
+/**
+ * JOIN 図に出す、結果の行の上で同じになる JOIN の種類。SQL に書いたとおりなら入れない。
+ * LEFT JOIN と RIGHT JOIN は実質 INNER JOIN のとき INNER JOIN。FULL JOIN は、WHERE などがどちらの側の NULL の行を除くかで
+ * LEFT JOIN・RIGHT JOIN・INNER JOIN になる（analyzeFullJoinNullRejection）。作用説明の「実質 … JOIN」と同じ判定
+ */
+export function effectiveJoinTypeByJoinId(query: ParsedQuery): Map<string, JoinType> {
+  const result = new Map<string, JoinType>();
+  for (const joinId of effectiveInnerAnalysisByJoinId(query).keys()) result.set(joinId, 'INNER JOIN');
+  for (const [joinId, rejection] of analyzeFullJoinNullRejection(query)) {
+    if (rejection.leftRejected && rejection.rightRejected) result.set(joinId, 'INNER JOIN');
+    else if (rejection.leftRejected) result.set(joinId, 'LEFT JOIN');
+    else if (rejection.rightRejected) result.set(joinId, 'RIGHT JOIN');
+  }
+  return result;
+}
+
+/** 実質の JOIN の種類の短い印（`≈INNER`・`≈LEFT`・`≈RIGHT`） */
+export function effectiveJoinTypeMark(type: JoinType): string {
+  return `≈${type.replace(/ JOIN$/, '')}`;
+}
+
 export function formatEffectiveInnerCausePhrase(reasons: EffectiveInnerReason[]): string {
   const innerReasons = reasons.filter((r) => r.kind === 'inner_join');
   if (innerReasons.length > 0) {
