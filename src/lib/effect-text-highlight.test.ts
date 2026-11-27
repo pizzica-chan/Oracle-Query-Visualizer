@@ -120,3 +120,28 @@ describe('引用符で囲んだ別名のツールチップ', () => {
     expect(alias && aliasTooltipFor(alias, parsed.query)).toBe('E E は sales の別名');
   });
 });
+
+describe('effect-text-highlight — 日本語の名前と Oracle の句', () => {
+  it('日本語の名前の修飾付きの列も、ASCII の名前と同じく列として色を付ける。語の途中からは始めない', () => {
+    const parsed = parseOracleQuery('SELECT 社員.名前 FROM 社員 JOIN 部署 ON 部署.id = 社員.部署id');
+    if (!parsed.success) throw new Error(parsed.error.message);
+    expect(kinds('結合条件「部署.id = 社員.部署id」', parsed.query)).toEqual([
+      { kind: 'string', text: '「' },
+      { kind: 'column', text: '部署.id' },
+      { kind: 'column', text: '社員.部署id' },
+      { kind: 'string', text: '」' },
+    ]);
+    expect(kinds('列の部署.id', parsed.query).some((s) => s.text === '列の部署.id')).toBe(false);
+  });
+
+  it('実質 LEFT JOIN と、階層問い合わせの句をキーワードとして色を付ける', () => {
+    expect(kinds('e と d は実質 LEFT JOIN — 階層の起点 — START WITH e.mgr IS NULL、CONNECT BY、ORDER SIBLINGS BY')).toEqual(
+      expect.arrayContaining([
+        { kind: 'keyword', text: '実質 LEFT JOIN' },
+        { kind: 'keyword', text: 'START WITH' },
+        { kind: 'keyword', text: 'CONNECT BY' },
+        { kind: 'keyword', text: 'ORDER SIBLINGS BY' },
+      ]),
+    );
+  });
+});

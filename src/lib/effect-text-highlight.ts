@@ -10,6 +10,11 @@ export interface EffectTextSegment {
 
 const SQL_KEYWORDS = [
   '実質 INNER JOIN',
+  '実質 LEFT JOIN',
+  '実質 RIGHT JOIN',
+  'ORDER SIBLINGS BY',
+  'START WITH',
+  'CONNECT BY',
   'STRAIGHT JOIN',
   'STRAIGHT_JOIN',
   'INNER JOIN',
@@ -39,7 +44,24 @@ const SQL_KEYWORDS = [
 
 const EMPHASIS_PHRASES: readonly string[] = [];
 
-const COLUMN_PATTERN = /^([a-zA-Z_][\w$]*)\.([a-zA-Z_*][\w$]*)/;
+/**
+ * `e.dept_id` のような修飾付きの列。日本語の名前（`部署.名前`）も列として色を付ける。
+ * `\w` は ASCII の文字しか含まないので、名前の文字は Unicode の文字・数字で数える
+ */
+const COLUMN_PATTERN = /^([\p{L}_][\p{L}\p{N}\p{M}_$#]*)\.([\p{L}_*][\p{L}\p{N}\p{M}_$#]*)/u;
+const NAME_CHAR = /[\p{L}\p{N}\p{M}_$#]/u;
+
+/**
+ * pos から修飾付きの列が始まるか。語の途中からは始めない。日本語の文と名前はどちらも文字なので、
+ * 「列の部署.id」の「列の部署」を 1 つの名前と読まないよう、ASCII でない修飾は、この SQL の表の名前か別名に限る
+ */
+function columnAt(text: string, pos: number, tableTerms: string[]): RegExpMatchArray | null {
+  if (pos > 0 && NAME_CHAR.test(text[pos - 1]!)) return null;
+  const match = text.slice(pos).match(COLUMN_PATTERN);
+  if (!match) return null;
+  const qualifier = match[1]!;
+  return /^[\x00-\x7f]*$/.test(qualifier) || tableTerms.includes(qualifier) ? match : null;
+}
 
 interface MatchCandidate {
   length: number;
@@ -180,7 +202,7 @@ function findBestMatch(
     }
   }
 
-  const columnMatch = text.slice(pos).match(COLUMN_PATTERN);
+  const columnMatch = columnAt(text, pos, tableTerms);
   if (columnMatch) {
     return {
       length: columnMatch[0].length,
@@ -218,7 +240,7 @@ function segmentInnerCondition(
     }
     if (matched) continue;
 
-    const columnMatch = text.slice(pos).match(COLUMN_PATTERN);
+    const columnMatch = columnAt(text, pos, tableTerms);
     if (columnMatch) {
       segments.push({ text: columnMatch[0], kind: 'column' });
       pos += columnMatch[0].length;
@@ -239,7 +261,7 @@ function segmentInnerCondition(
     let nextPos = pos + 1;
     while (nextPos < text.length) {
       const hasQualifiedTable = qualifiedTableTerms.some((term) => matchesTerm(text, nextPos, term));
-      const hasColumn = COLUMN_PATTERN.test(text.slice(nextPos));
+      const hasColumn = columnAt(text, nextPos, tableTerms) !== null;
       const hasTable = tableTerms.some((term) => matchesTerm(text, nextPos, term));
       if (hasQualifiedTable || hasColumn || hasTable) break;
       nextPos += 1;
