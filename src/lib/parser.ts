@@ -2041,6 +2041,14 @@ const UNSUPPORTED_SYNTAX: Array<{ pattern: RegExp; message: string }> = [
   { pattern: /\b(?:CROSS|OUTER)\s+APPLY\b/i, message: 'CROSS APPLY / OUTER APPLY は未対応です' },
   { pattern: /\bMODEL\s+(?:DIMENSION|PARTITION|MEASURES)\b/i, message: 'MODEL 句は未対応です' },
   { pattern: /\bMATCH_RECOGNIZE\s*\(/i, message: 'MATCH_RECOGNIZE は未対応です' },
+  // 分析関数の結果で絞る QUALIFY 句（「Analytic Functions」: … can appear only in the select list, QUALIFY clause, or the ORDER BY clause）
+  { pattern: /\bQUALIFY\b/i, message: 'QUALIFY 句は未対応です' },
+  // 構文図 group_by_clause の `GROUP BY ALL`
+  { pattern: /\bGROUP\s+BY\s+ALL\b/i, message: 'GROUP BY ALL は未対応です' },
+  // 構文図 values_clause の `(VALUES (…), (…)) t (列, …)`
+  { pattern: /(?:\bFROM|\bJOIN|,)\s*\(\s*VALUES\b/i, message: 'FROM 句の (VALUES …)（値を並べて表にする書き方）は未対応です' },
+  // WITH 句に書く PL/SQL の FUNCTION / PROCEDURE の宣言
+  { pattern: /^\s*WITH\s+(?:FUNCTION|PROCEDURE)\b/i, message: 'WITH 句の FUNCTION / PROCEDURE（PL/SQL の宣言）は未対応です' },
   // パーサーは「,」の後ろの項目が無いエラーにするので、余分な「,」を消すように案内してしまう
   { pattern: /\bON\s+OVERFLOW\s+(?:TRUNCATE|ERROR)\b/i, message: 'LISTAGG の ON OVERFLOW 句は未対応です' },
   // パーサーは ALL の位置の構文エラーにする。UNION ALL は読める
@@ -2303,7 +2311,28 @@ function detectUnsupportedSyntax(sql: string): string | null {
   for (const { pattern, message } of UNSUPPORTED_SYNTAX) {
     if (pattern.test(masked)) return message;
   }
+  if (hasDmlFromUsingClause(masked)) return 'UPDATE と DELETE の FROM / USING で表を結合する書き方は未対応です';
   return null;
+}
+
+/**
+ * UPDATE と DELETE の from_using_clause（構文図 UPDATE・DELETE: `… [ t_alias ] update_set_clause [ from_using_clause ]`、
+ * `DELETE [ FROM ] … [ t_alias ] [ from_using_clause ]`）。括弧の外で、対象の表より後ろにある FROM か USING を探す。
+ * SET の値やWHERE のサブクエリの中の FROM は括弧の中なので数えない
+ */
+function hasDmlFromUsingClause(masked: string): boolean {
+  const head = /^\s*(UPDATE|DELETE)\b(\s+FROM\b)?/i.exec(masked);
+  if (!head) return false;
+  let depth = 0;
+  for (let i = head[0].length; i < masked.length; i += 1) {
+    const ch = masked[i]!;
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    else if (depth === 0 && /[FfUu]/.test(ch) && !/[\w$#]/.test(masked[i - 1] ?? ' ') && /^(?:FROM|USING)\b/i.test(masked.slice(i, i + 6))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function parseOracleQuery(sql: string): ParseResult {

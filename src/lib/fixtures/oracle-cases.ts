@@ -913,6 +913,29 @@ FROM employees e START WITH e.manager_no IS NULL CONNECT BY PRIOR e.emp_no = e.m
     expectSuccess: false,
     errorContains,
   })),
+  // Oracle で書けるが、この解析では読めない構文。原因の分からない構文エラーではなく、未対応と書く
+  ...(
+    [
+      ['UPDATE の FROM での結合', 'UPDATE emp e SET e.sal = d.base FROM dept d WHERE d.id = e.dept_id', 'FROM / USING で表を結合する書き方は未対応です'],
+      ['DELETE の FROM での結合', 'DELETE emp e FROM dept d WHERE d.id = e.dept_id AND d.closed = 1', 'FROM / USING で表を結合する書き方は未対応です'],
+      ['FROM (VALUES …)', "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t (id, name)", 'FROM 句の (VALUES …)'],
+      ['QUALIFY', 'SELECT e.id FROM emp e QUALIFY ROW_NUMBER() OVER (ORDER BY e.sal DESC) = 1', 'QUALIFY 句は未対応です'],
+      ['GROUP BY ALL', 'SELECT e.dept_id, COUNT(*) FROM emp e GROUP BY ALL', 'GROUP BY ALL は未対応です'],
+      ['WITH FUNCTION', 'WITH FUNCTION f(x NUMBER) RETURN NUMBER IS BEGIN RETURN x * 2; END; SELECT f(e.sal) FROM emp e', 'WITH 句の FUNCTION / PROCEDURE'],
+    ] as const
+  ).map(([what, sql, errorContains]) => ({
+    name: `Oracle: ${what} は、未対応の構文としてエラーにする`,
+    category: 'error' as const,
+    sql,
+    expectSuccess: false,
+    errorContains,
+  })),
+  {
+    name: 'Oracle: SET の値と WHERE のサブクエリの FROM、FROM を省いた DELETE は読む',
+    category: 'update',
+    sql: 'UPDATE emp e SET e.sal = (SELECT MAX(x.sal) FROM emp x) WHERE e.id IN (SELECT y.id FROM emp y)',
+    expectSuccess: true,
+  },
   {
     // ON で参照できるのは、その JOIN までに結合した表と外側の問い合わせの表だけ（後ろの表は ORA-00904）
     name: 'Oracle: JOIN の ON から後ろの表を参照すると、エラーにする',

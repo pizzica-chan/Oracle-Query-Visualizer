@@ -1335,7 +1335,10 @@ function describeScope(query: ParsedQuery, mode: QueryEffectMode): QueryEffectSe
   const effectiveInnerByJoin = effectiveInnerAnalysisByJoinId(query);
 
   if (query.tables.length === 0) {
-    lines.push({ text: '対象テーブルが指定されていません' });
+    // FROM の無い SELECT（`SELECT 1 + 1`）は、表を読まずに式の値を 1 行だけ返す
+    lines.push({
+      text: query.statementType === 'SELECT' ? 'FROM が無いので、表を読まずに式の値を 1 行だけ返す' : '対象テーブルが指定されていません',
+    });
   } else {
     if (query.ctes?.length) {
       for (const cte of query.ctes) {
@@ -1501,7 +1504,13 @@ function primaryTarget(query: ParsedQuery): string {
 }
 
 function buildSummary(query: ParsedQuery, meta: (typeof ACTION_LABELS)[ParsedQuery['statementType']]): string {
-  // `SELECT SYSDATE FROM DUAL` のように DUAL だけを読む SELECT は、式の値が 1 行だけ返る（DUAL は 1 行だけのダミー表）
+  // `SELECT SYSDATE FROM DUAL` のように DUAL だけを読む SELECT は、式の値が 1 行だけ返る（DUAL は 1 行だけのダミー表）。
+  // FROM の無い SELECT（`SELECT 1 + 1`）も同じ。SQL Language Reference の SELECT では FROM 句は省略できる
+  // （「Use the optional FROM clause …」。ページの文は要約でしか確かめていない）
+  if (query.statementType === 'SELECT' && query.tables.length === 0) {
+    const condition = query.where ? 'WHERE 条件を満たすときだけ、' : '';
+    return `${condition}式の値が 1 行の結果として${meta.verb}`;
+  }
   if (
     query.statementType === 'SELECT' &&
     query.joins.length === 0 &&

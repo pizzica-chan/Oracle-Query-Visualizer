@@ -1464,3 +1464,15 @@ describe('行ロックの指定', () => {
     expect(effectLines('SELECT e.id FROM emp e FOR UPDATE', 'sql').map((l) => l.text)).toContain('FOR UPDATE');
   });
 });
+
+describe('FROM の無い SELECT', () => {
+  it('表を読まずに式の値を 1 行だけ返すと書き、「対象テーブルが指定されていません」と書かない', () => {
+    const parsed = parseOracleQuery('SELECT 1 + 1');
+    if (!parsed.success) throw new Error(parsed.error.message);
+    const effect = buildQueryEffect(parsed.query, 'japanese');
+    expect(effect.summary).toBe('式の値が 1 行の結果として表示される');
+    const texts = effect.sections.flatMap((s) => s.lines ?? []).map((l) => l.text);
+    expect(texts).toContain('FROM が無いので、表を読まずに式の値を 1 行だけ返す');
+    expect(texts).not.toContain('対象テーブルが指定されていません');
+  });
+});
