@@ -228,3 +228,16 @@ describe('引用符の要る名前と日本語の別名の置き換え', () => {
     expect(resolveAliasesInText('売上b.x = b.y', new Map([['b', 'orders']]))).toBe('売上b.x = orders.y');
   });
 });
+
+describe('applyAliasResolution — 外側の問い合わせの別名', () => {
+  it('相関サブクエリの中の外側の別名も実テーブル名にし、内側の同じ別名は内側の表を指す', () => {
+    const parsed = parseOracleQuery(
+      'SELECT d.name FROM dept d WHERE d.id IN (SELECT e.dept_id FROM emp e WHERE e.mgr = d.mgr) AND EXISTS (SELECT 1 FROM loc d WHERE d.id = 1)',
+    );
+    if (!parsed.success) throw new Error(parsed.error.message);
+    const resolved = applyAliasResolution(parsed.query, true, { keepSelfJoinAliases: true });
+    const [inSub, existsSub] = (resolved.where?.children ?? []).map((c) => c.nestedQuery);
+    expect(inSub?.where?.label).toBe('emp.mgr = dept.mgr');
+    expect(existsSub?.where?.label).toBe('loc.id = 1');
+  });
+});

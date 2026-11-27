@@ -8,6 +8,11 @@ export interface AliasResolutionOptions {
    * 「出力列や条件がどちらのインスタンスに掛かるか」の違いが消えてしまうため、比較側では true にする。
    */
   keepSelfJoinAliases?: boolean;
+  /**
+   * 外側の問い合わせの別名（内部で使う）。相関サブクエリの `WHERE e.mgr = d.mgr` の d は外側の表なので、
+   * 外側の別名でも置き換える。置き換えないと、実テーブル名で表示したときに、その別名だけが残る
+   */
+  outerAliases?: Map<string, string>;
 }
 
 function escapeRegExp(value: string): string {
@@ -189,6 +194,24 @@ function resolveDeleteTarget(target: DeleteTarget, aliasMap: Map<string, string>
   };
 }
 
+/**
+ * 外側の問い合わせの別名を足す。内側の表の名前（別名か、別名の無い表の名前）と同じものは、内側の表を指すので足さない
+ * （`WHERE EXISTS (SELECT 1 FROM dept e WHERE e.id = 1)` の e は、外側の e ではなく dept）
+ */
+function withOuterAliases(
+  own: Map<string, string>,
+  tables: TableRef[],
+  outer: Map<string, string> | undefined,
+): Map<string, string> {
+  if (!outer || outer.size === 0) return own;
+  const shadowed = new Set(tables.map((t) => (t.alias ?? t.table).toLowerCase()));
+  const merged = new Map(own);
+  for (const [alias, physical] of outer) {
+    if (!shadowed.has(alias.toLowerCase()) && !merged.has(alias)) merged.set(alias, physical);
+  }
+  return merged;
+}
+
 /** 解析結果の表示・比較用にエイリアスを実テーブル名へ置換する */
 export function applyAliasResolution(
   query: ParsedQuery,
@@ -197,7 +220,9 @@ export function applyAliasResolution(
 ): ParsedQuery {
   if (!enabled) return query;
 
-  const aliasMap = buildAliasMap(query.tables, options);
+  const aliasMap = withOuterAliases(buildAliasMap(query.tables, options), query.tables, options.outerAliases);
+  // 入れ子の問い合わせ（サブクエリ・派生テーブル・UNION のブランチ）には、この問い合わせの別名を外側の別名として渡す
+  options = { ...options, outerAliases: aliasMap };
 
   return {
     ...query,
