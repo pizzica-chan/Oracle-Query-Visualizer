@@ -886,6 +886,22 @@ function parseComparisonWithSubquery(node: any): ConditionNode {
   return parseComparison(node);
 }
 
+/**
+ * `NOT EXISTS (SELECT …)` の位置。SQL パーサーはこの形の条件に位置を返さない（`EXISTS (…)` には返す）ので、
+ * 中の SELECT の位置から、前の `NOT EXISTS (` と後ろの `)` まで広げる。広げられなければ位置を持たせない
+ */
+function notExistsLoc(node: any): any | undefined {
+  const inner = extractSubquerySelectAst(node.expr)?.loc;
+  if (typeof inner?.start?.offset !== 'number' || typeof inner?.end?.offset !== 'number') return undefined;
+  const masked = maskedProcessedSql();
+  const head = /NOT\s+EXISTS\s*\(\s*$/i.exec(masked.slice(0, inner.start.offset));
+  if (!head) return undefined;
+  let end = inner.end.offset;
+  while (end < masked.length && /\s/.test(masked[end]!)) end += 1;
+  if (masked[end] !== ')') return undefined;
+  return { start: { offset: head.index }, end: { offset: end + 1 } };
+}
+
 function parseConditionTree(node: any): ConditionNode | undefined {
   if (!node) return undefined;
 
@@ -1006,7 +1022,7 @@ function parseConditionTree(node: any): ConditionNode | undefined {
             label: subAst ? `${op} ${summarizeSelect(subAst)}` : `${op} (subquery)`,
             nestedQuery: subAst ? buildNestedSelect(subAst) : undefined,
           },
-          node,
+          node.loc ? node : { loc: notExistsLoc(node) },
         );
       }
 
@@ -2179,17 +2195,61 @@ function oracleOnlyAstError(ast: any, sql: string, processedToInput: number[]): 
   return null;
 }
 
+/** 後ろに続くと XOR を別名として読む語（`SELECT x xor FROM t` の xor は列の別名） */
+const CLAUSE_WORD_AFTER = String.raw`(?!\s+(?:FROM|WHERE|GROUP|ORDER|HAVING|UNION|INTERSECT|MINUS|EXCEPT|FETCH|OFFSET|FOR|CONNECT|START|JOIN|INNER|LEFT|RIGHT|FULL|CROSS|NATURAL|ON|USING)\b)`;
+
 /**
- * MySQL の書き方で、Oracle には無い記号。SQL パーサーは読めるか、読めずに原因の分からない構文エラーにする。
- * バッククォートは MySQL の名前の囲み方（Oracle では「"」で囲む）。`<=>` は MySQL の NULL どうしも等しいとみなす等価演算子
+ * MySQL の書き方で、Oracle には無いもの。SQL パーサー（MySQL ビルド）は読めるので、受け付けると Oracle では動かない SQL を
+ * 説明する（LOCK IN SHARE MODE や WITH ROLLUP は、作用説明から黙って落としていた）。読めずに原因の分からない構文エラーにするものもある。
+ * いずれも Oracle Database 23 SQL Language Reference で確かめた。集合演算の後ろは [ALL] だけ（構文図 subquery）、論理演算は
+ * NOT・AND・OR だけ（「Logical Conditions」）、INTERVAL の値は引用符で囲む（構文図 interval_day_to_second）、
+ * GROUP BY に WITH ROLLUP は無い（構文図 group_by_clause・rollup_cube_clause）。group は位置を示す部分
  */
-function backtickIdentifierError(sql: string, leadingTrim: number, inputSql: string): ParseResult | null {
-  const code = maskLiteralsAndComments(sql);
-  const found = [
-    { at: code.indexOf('`'), text: '`', message: '「`」は Oracle では使えません。名前を囲むなら「"」で囲んでください' },
-    { at: code.indexOf('<=>'), text: '<=>', message: '「<=>」は Oracle にありません。NULL どうしを比べるなら IS NULL を使ってください' },
-  ]
-    .filter((entry) => entry.at >= 0)
+const MYSQL_ONLY_SYNTAX: Array<{ pattern: RegExp; message: (m: RegExpExecArray) => string; group?: number }> = [
+  { pattern: /`/, message: () => '「`」は Oracle では使えません。名前を囲むなら「"」で囲んでください' },
+  { pattern: /<=>/, message: () => '「<=>」は Oracle にありません。NULL どうしを比べるなら IS NULL を使ってください' },
+  { pattern: /&&/, message: () => '「&&」は Oracle にありません。AND と書いてください' },
+  { pattern: /(?<![\p{L}\p{N}_$#"])#/u, message: () => '「#」は Oracle ではコメントになりません。コメントは -- か /* */ で書いてください' },
+  {
+    pattern: /\b(UNION|INTERSECT|MINUS|EXCEPT)\s+DISTINCT\b/i,
+    message: (m) => `「${m[0].replace(/\s+/g, ' ').toUpperCase()}」は Oracle にありません。重複をまとめるなら ${m[1]!.toUpperCase()} だけを書いてください`,
+  },
+  { pattern: /\bSTRAIGHT_JOIN\b/i, message: () => '「STRAIGHT_JOIN」は Oracle にありません。結合の順は /*+ LEADING(…) */ のヒントで指定してください' },
+  { pattern: /\b(?:USE|FORCE|IGNORE)\s+(?:INDEX|KEY)\b/i, message: () => '索引の指定（USE INDEX など）は Oracle にありません。/*+ INDEX(…) */ のヒントで書いてください' },
+  { pattern: /\bWITH\s+ROLLUP\b/i, message: () => '「WITH ROLLUP」は Oracle にありません。GROUP BY ROLLUP (…) と書いてください' },
+  { pattern: /\bLOCK\s+IN\s+SHARE\s+MODE\b/i, message: () => '「LOCK IN SHARE MODE」は Oracle にありません。行をロックするなら FOR UPDATE と書いてください' },
+  { pattern: /\bFOR\s+SHARE\b/i, message: () => '「FOR SHARE」は Oracle にありません。行をロックするなら FOR UPDATE と書いてください' },
+  { pattern: /\b(?:REGEXP|RLIKE)\b/i, message: () => '「REGEXP」演算子は Oracle にありません。REGEXP_LIKE(列, パターン) と書いてください' },
+  { pattern: /\bLIKE\s+BINARY\b/i, message: () => '「LIKE BINARY」は Oracle にありません。Oracle の LIKE は、既定で大文字と小文字を区別して比べます' },
+  { pattern: /\bINTERVAL\s+(?=[\d-])/i, message: () => '「INTERVAL」の値は、Oracle では引用符で囲みます（INTERVAL \'1\' DAY）' },
+  {
+    pattern: /\bSELECT\s+(?:(?:ALL|DISTINCT)\s+)?(SQL_\w+|DISTINCTROW|HIGH_PRIORITY)\b/i,
+    message: (m) => `「${m[1]!.toUpperCase()}」は Oracle にありません`,
+    group: 1,
+  },
+  {
+    pattern: /\b(?:UPDATE|DELETE)\s+(IGNORE|LOW_PRIORITY|QUICK)\b/i,
+    message: (m) => `「${m[1]!.toUpperCase()}」は Oracle の UPDATE と DELETE にありません`,
+    group: 1,
+  },
+  { pattern: /\bINTO\s+@/i, message: () => '「INTO @変数」は MySQL の書き方で、Oracle にはありません' },
+  {
+    pattern: new RegExp(String.raw`(?<=[\p{L}\p{N}_)'"]\s+)XOR${CLAUSE_WORD_AFTER}(?=\s+[\p{L}\p{N}_('":])`, 'iu'),
+    message: () => '「XOR」は Oracle にありません。(a AND NOT b) OR (NOT a AND b) のように書いてください',
+  },
+];
+
+function mysqlOnlySyntaxError(sql: string, leadingTrim: number, inputSql: string): ParseResult | null {
+  // 文字列・コメント・引用識別子の中は伏せる（`"A #B"` の # はコメントではなく名前の一部）
+  const code = maskNonCode(sql);
+  const found = MYSQL_ONLY_SYNTAX.map((entry) => {
+    const match = entry.pattern.exec(code);
+    if (!match) return null;
+    const part = entry.group ? match[entry.group]! : match[0];
+    const at = match.index + (entry.group ? match[0].indexOf(part) : 0);
+    return { at, length: part.trimEnd().length || 1, message: entry.message(match) };
+  })
+    .filter((hit): hit is { at: number; length: number; message: string } => hit !== null)
     .sort((a, b) => a.at - b.at)[0];
   if (!found) return null;
   const start = found.at + leadingTrim;
@@ -2199,7 +2259,7 @@ function backtickIdentifierError(sql: string, leadingTrim: number, inputSql: str
     error: {
       message: `${line} 行 ${column} 列の${found.message}`,
       position: start,
-      span: { start, end: start + found.text.length },
+      span: { start, end: start + found.length },
     },
   };
 }
@@ -2258,8 +2318,8 @@ export function parseOracleQuery(sql: string): ParseResult {
   if (unsupported) {
     return { success: false, error: { message: unsupported } };
   }
-  const backtick = backtickIdentifierError(trimmed, sql.length - sql.trimStart().length, sql);
-  if (backtick) return backtick;
+  const mysqlOnly = mysqlOnlySyntaxError(trimmed, sql.length - sql.trimStart().length, sql);
+  if (mysqlOnly) return mysqlOnly;
 
   // 位置（sourceSpan）は呼び出し元が渡した sql 上のオフセットで返す。
   // 解析は前後の空白を取り除いた文字列で行うので、先頭の空白の分だけ後ろへずらす。
