@@ -2550,11 +2550,50 @@ function outerJoinRestrictionResult(query: ParsedQuery, sql: string): ParseResul
   return { success: true, query };
 }
 
+/**
+ * JOIN の ON から、FROM 句でその JOIN より後ろにある表を参照していないか。ON で参照できるのは、その JOIN までに出てきた表と
+ * 外側の問い合わせの表だけで、後ろの表を参照すると Oracle はエラーにする（ORA-00904: invalid identifier）。SQL パーサーは
+ * 受け付けるので、Oracle では動かない SQL を説明してしまう。正しい SQL をエラーにしないよう、ほかの問い合わせのブロックにも
+ * ある名前（外側の問い合わせやサブクエリの表）は調べない
+ */
+function forwardJoinReferenceError(query: ParsedQuery, sql: string): ParseResult | null {
+  const withNames = maskLiteralsAndComments(sql);
+  const blocks = queryBlocksOf(query);
+  const key = (t: TableRef) => (t.alias ?? t.table).toUpperCase();
+  const reference = new RegExp(String.raw`(?<![\p{L}\p{N}\p{M}_$#".])(${NAME_PART_SOURCE})\s*\.\s*${NAME_PART_SOURCE}`, 'gu');
+  for (const block of blocks) {
+    const elsewhere = new Set(blocks.filter((b) => b !== block).flatMap((b) => b.tables.map(key)));
+    for (const join of block.joins) {
+      if (join.fromWhereClause || !join.sourceSpan) continue;
+      const targetIndex = block.tables.findIndex((t) => t.id === join.targetId);
+      if (targetIndex < 0) continue;
+      const visible = new Set(block.tables.slice(0, targetIndex + 1).map(key));
+      const later = new Set(block.tables.slice(targetIndex + 1).map(key));
+      const text = withNames.slice(join.sourceSpan.start, join.sourceSpan.end);
+      for (const match of text.matchAll(reference)) {
+        const name = unquoteNamePart(match[1]!).toUpperCase();
+        if (!later.has(name) || visible.has(name) || elsewhere.has(name)) continue;
+        const start = join.sourceSpan.start + match.index!;
+        const { line, column } = lineColumnAt(sql, start);
+        return {
+          success: false,
+          error: {
+            message: `${line} 行 ${column} 列の「${match[0]}」は、この JOIN より後ろの表を参照しています。ON では、それまでに結合した表だけを参照できます`,
+            position: start,
+            span: { start, end: start + match[0].length },
+          },
+        };
+      }
+    }
+  }
+  return null;
+}
+
 /** 解析結果で確かめる Oracle の制限。(+) の制限と、表の別名の前の AS */
 function oracleRestrictionResult(query: ParsedQuery, sql: string): ParseResult {
   const outerJoin = outerJoinRestrictionResult(query, sql);
   if (!outerJoin.success) return outerJoin;
-  return tableAliasAsError(query, sql) ?? outerJoin;
+  return tableAliasAsError(query, sql) ?? forwardJoinReferenceError(query, sql) ?? outerJoin;
 }
 
 /**

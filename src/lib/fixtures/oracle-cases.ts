@@ -914,6 +914,20 @@ FROM employees e START WITH e.manager_no IS NULL CONNECT BY PRIOR e.emp_no = e.m
     errorContains,
   })),
   {
+    // ON で参照できるのは、その JOIN までに結合した表と外側の問い合わせの表だけ（後ろの表は ORA-00904）
+    name: 'Oracle: JOIN の ON から後ろの表を参照すると、エラーにする',
+    category: 'error',
+    sql: 'SELECT a.id FROM a JOIN b ON b.id = c.bid JOIN c ON c.aid = a.id',
+    expectSuccess: false,
+    errorContains: '「c.bid」は、この JOIN より後ろの表を参照しています',
+  },
+  {
+    name: 'Oracle: ON の中の、前に結合した表と外側の問い合わせの表への参照は読む',
+    category: 'oracle',
+    sql: 'SELECT a.id FROM a WHERE EXISTS (SELECT 1 FROM b JOIN c ON c.bid = b.id AND c.aid = a.id) AND a.id IN (SELECT c.id FROM c JOIN d ON d.cid = c.id)',
+    expectSuccess: true,
+  },
+  {
     name: 'Oracle: # を含む名前、引用符で囲んだ名前の中の #、引用符で囲んだ INTERVAL は読む',
     category: 'oracle',
     sql: `SELECT e.emp#, "A #B" FROM emp e WHERE e.d > SYSDATE - INTERVAL '1' DAY`,
