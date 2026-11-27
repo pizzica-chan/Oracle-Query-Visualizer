@@ -52,3 +52,15 @@ describe('条件の位置', () => {
     expect(missing).toEqual([]);
   });
 });
+
+describe('GROUP BY と ORDER BY の項目の範囲', () => {
+  it('SQL パーサーが位置を返さない数値と CASE 式の項目も、SQL の中の範囲を持つ', () => {
+    const sql =
+      "SELECT e.k, COUNT(*) c FROM emp e GROUP BY 1, CASE WHEN e.x > 1 THEN 'a' END ORDER BY 2 DESC, CASE WHEN e.k = 1 THEN 0 END";
+    const result = parseOracleQuery(sql);
+    if (!result.success) throw new Error(result.error.message);
+    const text = (s?: { start: number; end: number }) => (s ? sql.slice(s.start, s.end) : undefined);
+    expect(result.query.groupBy.map((g) => text(g.sourceSpan))).toEqual(['1', "CASE WHEN e.x > 1 THEN 'a' END"]);
+    expect(result.query.orderBy.map((o) => text(o.sourceSpan))).toEqual(['2 DESC', 'CASE WHEN e.k = 1 THEN 0 END']);
+  });
+});

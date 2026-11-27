@@ -1476,3 +1476,12 @@ describe('FROM の無い SELECT', () => {
     expect(texts).not.toContain('対象テーブルが指定されていません');
   });
 });
+
+describe('SQL の書き方での説明', () => {
+  it('ORDER SIBLINGS BY は、SIBLINGS を落とさずに書く', () => {
+    const parsed = parseOracleQuery('SELECT e.name FROM emp e START WITH e.mgr IS NULL CONNECT BY PRIOR e.id = e.mgr ORDER SIBLINGS BY e.name');
+    if (!parsed.success) throw new Error(parsed.error.message);
+    const texts = buildQueryEffect(parsed.query, 'sql').sections.flatMap((s) => s.lines ?? []).map((l) => l.text);
+    expect(texts).toContain('ORDER SIBLINGS BY e.name');
+  });
+});

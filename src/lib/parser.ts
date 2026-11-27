@@ -1749,9 +1749,11 @@ function buildSelectParsedCore(ast: any): ParsedQuery {
 
   const derivedJoins = deriveJoinsFromWhere(tables, commaJoinedIndexes, where);
 
-  const groupBy: SqlFragment[] = toArray<any>(ast.groupby?.columns ?? ast.groupby).map((g: any) => ({
+  const groupEntries = toArray<any>(ast.groupby?.columns ?? ast.groupby);
+  const groupSpans = groupEntries.some((g: any) => !g?.loc) ? clauseItemSpans(ast, 'GROUP', groupEntries.length) : [];
+  const groupBy: SqlFragment[] = groupEntries.map((g: any, index: number) => ({
     text: exprToString(g),
-    sourceSpan: toSourceSpan(g.loc),
+    sourceSpan: toSourceSpan(g.loc) ?? groupSpans[index],
   }));
 
   const orderBy = parseOrderByEntries(ast.orderby, ast);
@@ -1777,9 +1779,63 @@ function buildSelectParsedCore(ast: any): ParsedQuery {
   };
 }
 
+/**
+ * GROUP BY / ORDER BY の項目の範囲（前処理後の SQL の座標）を、SQL の文から求める。SQL パーサーは数値（`ORDER BY 2`）や
+ * CASE 式に位置を返さないので、その項目は作用説明をクリックしても SQL を選べなかった。この SELECT の範囲の中で、括弧の外にある
+ * 最後のキーワードから、括弧の外の `,` で項目を区切る。区切った数が項目の数と合わないときは使わない
+ */
+function clauseItemSpans(ast: any, keyword: 'GROUP' | 'ORDER', count: number): Array<SourceSpan | undefined> {
+  const start = locStartOffset(ast);
+  const end = ast?.loc?.end?.offset;
+  if (start == null || typeof end !== 'number' || count === 0) return [];
+  const masked = maskedProcessedSql();
+  const keywordRe = keyword === 'GROUP' ? /^GROUP\s+BY\b/i : /^ORDER\s+(?:SIBLINGS\s+)?BY\b/i;
+  const stopRe = /^(?:HAVING|ORDER|UNION|INTERSECT|MINUS|EXCEPT|FETCH|OFFSET|LIMIT|FOR|WINDOW|LOCK|INTO|WITH)\b/i;
+  const atWord = (i: number) => /[A-Za-z]/.test(masked[i] ?? '') && !/[\w$#]/.test(masked[i - 1] ?? ' ');
+  let depth = 0;
+  let clauseStart = -1;
+  for (let i = start; i < end; i += 1) {
+    const ch = masked[i]!;
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    else if (depth === 0 && atWord(i)) {
+      const hit = keywordRe.exec(masked.slice(i, i + 24));
+      if (hit) clauseStart = i + hit[0].length;
+    }
+  }
+  if (clauseStart < 0) return [];
+  const spans: Array<SourceSpan | undefined> = [];
+  const pushItem = (from: number, to: number) => {
+    const text = masked.slice(from, to);
+    const lead = text.length - text.trimStart().length;
+    const body = text.trim();
+    spans.push(body ? { start: from + lead, end: from + lead + body.length } : undefined);
+  };
+  depth = 0;
+  let itemStart = clauseStart;
+  let i = clauseStart;
+  for (; i < masked.length; i += 1) {
+    const ch = masked[i]!;
+    if (ch === '(') depth += 1;
+    else if (ch === ')') {
+      if (depth === 0) break;
+      depth -= 1;
+    } else if (depth === 0 && ch === ',') {
+      pushItem(itemStart, i);
+      itemStart = i + 1;
+    } else if (depth === 0 && (ch === ';' || (keyword === 'GROUP' && atWord(i) && stopRe.test(masked.slice(i, i + 12))))) {
+      break;
+    }
+  }
+  pushItem(itemStart, i);
+  return spans.length === count ? spans : [];
+}
+
 function parseOrderByEntries(entries: any, ownerAst?: any): SqlFragment[] {
-  return toArray<any>(entries).map((o: any) => {
-    const span = orderByEntrySourceSpan(o, processedSql);
+  const list = toArray<any>(entries);
+  const itemSpans = ownerAst && list.some((o: any) => !o?.expr?.loc) ? clauseItemSpans(ownerAst, 'ORDER', list.length) : [];
+  return list.map((o: any, index: number) => {
+    const span = orderByEntrySourceSpan(o, processedSql) ?? itemSpans[index];
     const nulls = nullsOrderFor(o, ownerAst);
     // NULLS FIRST / LAST は前処理で空白に置き換わり、AST の範囲の外にある。項目の範囲はその終わりまで延ばす
     const nullsEnd = nulls ? nulls.processedPos + nulls.processedLength : undefined;

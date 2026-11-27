@@ -127,7 +127,8 @@ function formatSelectColumnSql(col: SelectColumn): string {
 function formatOrderByClause(query: ParsedQuery): EffectLine | null {
   if (query.orderBy.length === 0) return null;
   return {
-    text: `ORDER BY ${query.orderBy.map((o) => o.text).join(', ')}`,
+    // ORDER SIBLINGS BY は、階層の順を保って同じ親の行どうしを並べる。SIBLINGS を落とすと結果全体の並べ替えに読める
+    text: `ORDER ${query.orderSiblingsSpan ? 'SIBLINGS ' : ''}BY ${query.orderBy.map((o) => o.text).join(', ')}`,
     sourceSpan: query.orderBy[0]?.sourceSpan,
   };
 }
