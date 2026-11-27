@@ -709,8 +709,20 @@ function rowLimitFields(limit: RowLimitInfo | undefined): RowLimitFields {
   };
 }
 
-/** ORDER BY エントリの直後にあった NULLS FIRST / LAST を拾う */
-function nullsOrderFor(entry: any): NullsOrderInfo | undefined {
+/**
+ * ORDER BY エントリの直後にあった NULLS FIRST / LAST を拾う。
+ * SQL パーサーは数値（`ORDER BY 2 DESC NULLS LAST` の 2）に位置を返さないので、そのときは、この SELECT が持つ記録
+ * （ownerAst。入れ子の SELECT の中は除く）のうち、直前が同じ数値と並び順のものを選ぶ。分析関数の ORDER BY には位置を
+ * 書けない（SQL Language Reference「Analytic Functions」）ので、数値の直後の NULLS はこの ORDER BY のもの
+ */
+function nullsOrderFor(entry: any, ownerAst?: any): NullsOrderInfo | undefined {
+  if (entry?.expr?.type === 'number' && !entry.expr.loc) {
+    const candidates = ownerAst ? recordsOwnedBySelect(ownerAst, nullsOrders) : nullsOrders;
+    return candidates.find((info) => {
+      const before = /(?<![\w.$#])(\d+)(?:\s+(ASC|DESC))?\s*$/i.exec(processedSql.slice(0, info.processedPos));
+      return before?.[1] === String(entry.expr.value) && (before[2]?.toUpperCase() ?? '') === (entry.type ?? '').toUpperCase();
+    });
+  }
   const end = entry?.expr?.loc?.end?.offset;
   if (typeof end !== 'number' || nullsOrders.length === 0) return undefined;
   return nullsOrders.find((info) => {
@@ -1470,6 +1482,10 @@ function parseFromClause(from: any[]): FromClauseResult {
     const isNatural = isNaturalJoinEntry(entry, prevEntry);
     let { condition, parts, conditionRoot } = parseJoinConditionFromEntry(entry, prevTable, tableRef);
 
+    // NATURAL JOIN は同じ名前の列で結ぶので、ON も USING も書けない（構文図 outer_join_clause・inner_cross_join_clause）
+    if (isNatural && (entry.on || entry.using)) {
+      throw new Error(`「${tableRef.alias ?? tableRef.table}」との NATURAL JOIN には、ON も USING も書けません`);
+    }
     if (isNatural && condition === NO_JOIN_CONDITION) {
       condition = 'NATURAL JOIN';
     }
@@ -1722,7 +1738,7 @@ function buildSelectParsedCore(ast: any): ParsedQuery {
     sourceSpan: toSourceSpan(g.loc),
   }));
 
-  const orderBy = parseOrderByEntries(ast.orderby);
+  const orderBy = parseOrderByEntries(ast.orderby, ast);
 
   const hints = hintsForAst(ast);
 
@@ -1745,10 +1761,10 @@ function buildSelectParsedCore(ast: any): ParsedQuery {
   };
 }
 
-function parseOrderByEntries(entries: any): SqlFragment[] {
+function parseOrderByEntries(entries: any, ownerAst?: any): SqlFragment[] {
   return toArray<any>(entries).map((o: any) => {
-    const nulls = nullsOrderFor(o);
     const span = orderByEntrySourceSpan(o, processedSql);
+    const nulls = nullsOrderFor(o, ownerAst);
     // NULLS FIRST / LAST は前処理で空白に置き換わり、AST の範囲の外にある。項目の範囲はその終わりまで延ばす
     const nullsEnd = nulls ? nulls.processedPos + nulls.processedLength : undefined;
     return {
@@ -2046,6 +2062,175 @@ const STATEMENT_KEYWORDS: Array<{ pattern: RegExp; label: string }> = [
   { pattern: /^\s*CALL\b|^\s*EXEC(?:UTE)?\b/i, label: 'プロシージャ呼び出し' },
 ];
 
+/** AST の中の SELECT・UPDATE・DELETE をすべて集める（サブクエリ・UNION のブランチ・WITH の中を含む） */
+function statementAsts(node: any, out: any[] = [], seen = new Set<any>()): any[] {
+  if (!node || typeof node !== 'object' || seen.has(node)) return out;
+  seen.add(node);
+  if (Array.isArray(node)) {
+    node.forEach((item) => statementAsts(item, out, seen));
+    return out;
+  }
+  if (node.type === 'select' || node.type === 'update' || node.type === 'delete') out.push(node);
+  for (const [key, value] of Object.entries(node)) {
+    if (key !== 'loc') statementAsts(value, out, seen);
+  }
+  return out;
+}
+
+/** 1 つの問い合わせのブロックの中で、条件に合う AST のノードを探す。サブクエリ（別の SELECT）の中には入らない */
+function findInBlockAst(node: any, match: (n: any) => boolean): any | undefined {
+  if (!node || typeof node !== 'object') return undefined;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findInBlockAst(item, match);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (node.type === 'select' || node.ast) return undefined;
+  if (match(node)) return node;
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'loc') continue;
+    const found = findInBlockAst(value, match);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
+ * SQL パーサー（MySQL ビルド）は読めるが、Oracle では書けない形（Oracle Database 23 SQL Language Reference）。
+ * 受け付けると、Oracle では動かない SQL を説明するうえに、LIMIT のように読んだ指定を作用説明から黙って落とす。
+ * - LIMIT は無い（行制限句は OFFSET … / FETCH FIRST …）
+ * - UPDATE と DELETE に ORDER BY と LIMIT は無く、UPDATE の表の後ろに JOIN は書けない（構文図 UPDATE・DELETE）
+ * - WHERE に集約関数は書けない（ORA-00934: group function is not allowed here）
+ * - 分析関数は SELECT の列・QUALIFY・ORDER BY にだけ書ける（「Analytic Functions」）
+ * - USING の列には表の名前を付けられない（ORA-25154: column part of USING clause cannot have qualifier）
+ */
+function oracleOnlyAstError(ast: any, sql: string, processedToInput: number[]): ParseResult | null {
+  const errorAtLoc = (loc: any, message: string): ParseResult => {
+    const start = processedToInput[loc?.start?.offset ?? -1];
+    const endIndex = (loc?.end?.offset ?? 0) - 1;
+    const end = processedToInput[endIndex];
+    if (start === undefined || end === undefined) return { success: false, error: { message } };
+    // パーサーの位置は後ろの空白まで延びるので、範囲から除く
+    let spanEnd = end + 1;
+    while (spanEnd > start + 1 && /\s/.test(sql[spanEnd - 1] ?? '')) spanEnd -= 1;
+    const at = lineColumnAt(sql, start);
+    return { success: false, error: { message: `${at.line} 行 ${at.column} 列の${message}`, position: start, span: { start, end: spanEnd } } };
+  };
+  /** loc の始まりの直前にあるキーワード（`ORDER BY`・`JOIN`）を示すエラー */
+  const masked = maskNonCode(sql);
+  const errorAtKeywordBefore = (loc: any, keyword: RegExp, message: string): ParseResult => {
+    const from = processedToInput[loc?.start?.offset ?? -1];
+    const hit = from === undefined ? null : keyword.exec(masked.slice(0, from));
+    if (!hit) return { success: false, error: { message } };
+    const start = hit.index;
+    const end = start + hit[0].trimEnd().length;
+    const at = lineColumnAt(sql, start);
+    return { success: false, error: { message: `${at.line} 行 ${at.column} 列の${message}`, position: start, span: { start, end } } };
+  };
+  for (const statement of statementAsts(ast)) {
+    const kind = statement.type === 'select' ? 'SELECT' : statement.type === 'update' ? 'UPDATE' : 'DELETE';
+    if (statement.limit?.value?.length) {
+      return errorAtLoc(
+        statement.limit.loc,
+        kind === 'SELECT'
+          ? '「LIMIT」は Oracle にありません。FETCH FIRST n ROWS ONLY と書いてください'
+          : `「LIMIT」は Oracle の ${kind} にありません。対象の行は WHERE で絞ってください`,
+      );
+    }
+    if (kind !== 'SELECT' && statement.orderby?.length) {
+      return errorAtKeywordBefore(statement.orderby[0]?.expr?.loc, /\bORDER\s+BY\s*$/i, `「ORDER BY」は Oracle の ${kind} にありません`);
+    }
+    if (kind === 'UPDATE') {
+      const joined = toArray<any>(statement.table).find((entry) => entry?.join);
+      if (joined) {
+        return errorAtKeywordBefore(
+          joined.loc,
+          /\b(?:(?:INNER|LEFT|RIGHT|FULL|CROSS)\s+(?:OUTER\s+)?)?JOIN\s*$/i,
+          '「JOIN」は、Oracle の UPDATE では更新する表の後ろに書けません',
+        );
+      }
+    }
+    const aggregate = findInBlockAst(statement.where, (n) => n.type === 'aggr_func' && !n.over);
+    if (aggregate) {
+      return errorAtLoc(aggregate.loc, '集約関数は WHERE に書けません。集約した値で絞るなら HAVING に書いてください');
+    }
+    const analytic = findInBlockAst(statement.where, (n) => Boolean(n.over));
+    if (analytic) {
+      return errorAtLoc(analytic.loc, '分析関数（OVER (…)）は WHERE に書けません。サブクエリの外側で絞ってください');
+    }
+    const usingColumns = new Set(
+      toArray<any>(statement.from).flatMap((entry) => toArray<any>(entry?.using).map((u) => String(u?.value ?? u).toUpperCase())),
+    );
+    if (usingColumns.size > 0) {
+      const qualified = findInBlockAst(
+        [statement.columns, statement.where, statement.groupby, statement.having, statement.orderby],
+        (n) => n.type === 'column_ref' && Boolean(n.table) && usingColumns.has(formatIdentifier(n.column).toUpperCase()),
+      );
+      if (qualified) {
+        return errorAtLoc(
+          qualified.loc,
+          `「${formatIdentifier(qualified.table)}.${formatIdentifier(qualified.column)}」は USING で結合した列なので、表の名前を付けずに書いてください`,
+        );
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * MySQL の書き方で、Oracle には無い記号。SQL パーサーは読めるか、読めずに原因の分からない構文エラーにする。
+ * バッククォートは MySQL の名前の囲み方（Oracle では「"」で囲む）。`<=>` は MySQL の NULL どうしも等しいとみなす等価演算子
+ */
+function backtickIdentifierError(sql: string, leadingTrim: number, inputSql: string): ParseResult | null {
+  const code = maskLiteralsAndComments(sql);
+  const found = [
+    { at: code.indexOf('`'), text: '`', message: '「`」は Oracle では使えません。名前を囲むなら「"」で囲んでください' },
+    { at: code.indexOf('<=>'), text: '<=>', message: '「<=>」は Oracle にありません。NULL どうしを比べるなら IS NULL を使ってください' },
+  ]
+    .filter((entry) => entry.at >= 0)
+    .sort((a, b) => a.at - b.at)[0];
+  if (!found) return null;
+  const start = found.at + leadingTrim;
+  const { line, column } = lineColumnAt(inputSql, start);
+  return {
+    success: false,
+    error: {
+      message: `${line} 行 ${column} 列の${found.message}`,
+      position: start,
+      span: { start, end: start + found.text.length },
+    },
+  };
+}
+
+/**
+ * 表の別名の前の AS。Oracle の構文図 table_reference は `[ t_alias ]` で、AS を書けない（列の別名には書ける）。
+ * SQL パーサーは受け付けるので、表の範囲の終わりが `AS 別名` になっているかで調べる
+ */
+function tableAliasAsError(query: ParsedQuery, sql: string): ParseResult | null {
+  const masked = maskNonCode(sql);
+  for (const block of queryBlocksOf(query)) {
+    for (const table of block.tables) {
+      if (!table.alias || !table.sourceSpan) continue;
+      const text = masked.slice(table.sourceSpan.start, table.sourceSpan.end);
+      const as = /\bAS\s+\S+\s*$/i.exec(text);
+      if (!as || /^AS\s+OF\b/i.test(as[0])) continue;
+      const start = table.sourceSpan.start + as.index;
+      const { line, column } = lineColumnAt(sql, start);
+      return {
+        success: false,
+        error: {
+          message: `${line} 行 ${column} 列の「AS」は、Oracle では表の別名の前に書けません。「AS」を消してください`,
+          position: start,
+          span: { start, end: start + 2 },
+        },
+      };
+    }
+  }
+  return null;
+}
+
 /** 解析前に、未対応と分かっている構文をはっきりしたメッセージで弾く */
 function detectUnsupportedSyntax(sql: string): string | null {
   const masked = maskNonCode(sql);
@@ -2073,6 +2258,8 @@ export function parseOracleQuery(sql: string): ParseResult {
   if (unsupported) {
     return { success: false, error: { message: unsupported } };
   }
+  const backtick = backtickIdentifierError(trimmed, sql.length - sql.trimStart().length, sql);
+  if (backtick) return backtick;
 
   // 位置（sourceSpan）は呼び出し元が渡した sql 上のオフセットで返す。
   // 解析は前後の空白を取り除いた文字列で行うので、先頭の空白の分だけ後ろへずらす。
@@ -2103,6 +2290,8 @@ export function parseOracleQuery(sql: string): ParseResult {
     });
     // パーサーは WHERE などの中で AND と OR を同じ優先順位で結び付けるので、Oracle の優先順位で組み直す
     fixLogicalOperatorPrecedence(ast);
+    const oracleOnly = oracleOnlyAstError(ast, sql, processedToInputForError);
+    if (oracleOnly) return oracleOnly;
     // 先頭 `;` などで astify が type を持たない空要素を返すことがある。文数に数えない
     const statements = (Array.isArray(ast) ? ast : [ast]).filter((statement) => statement?.type);
     const first = statements[0];
@@ -2167,17 +2356,17 @@ export function parseOracleQuery(sql: string): ParseResult {
       const query = locking
         ? { ...parsed, lockingClause: locking.text, lockingClauseSpan: locking.sourceSpan }
         : parsed;
-      return outerJoinRestrictionResult(remap(query), sql);
+      return oracleRestrictionResult(remap(query), sql);
     }
 
     if (first.type === 'update') {
       const query = parseUpdateAst(first, sql);
-      return outerJoinRestrictionResult(remap(query), sql);
+      return oracleRestrictionResult(remap(query), sql);
     }
 
     if (first.type === 'delete') {
       const query = parseDeleteAst(first, sql);
-      return outerJoinRestrictionResult(remap(query), sql);
+      return oracleRestrictionResult(remap(query), sql);
     }
 
     return {
@@ -2299,6 +2488,13 @@ function outerJoinRestrictionResult(query: ParsedQuery, sql: string): ParseResul
     return errorAt(start, end, '「(+)」を含む条件は OR でつなげません。外部結合は LEFT JOIN … ON で書いてください');
   }
   return { success: true, query };
+}
+
+/** 解析結果で確かめる Oracle の制限。(+) の制限と、表の別名の前の AS */
+function oracleRestrictionResult(query: ParsedQuery, sql: string): ParseResult {
+  const outerJoin = outerJoinRestrictionResult(query, sql);
+  if (!outerJoin.success) return outerJoin;
+  return tableAliasAsError(query, sql) ?? outerJoin;
 }
 
 /**

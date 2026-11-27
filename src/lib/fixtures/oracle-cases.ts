@@ -874,6 +874,36 @@ FROM employees e START WITH e.manager_no IS NULL CONNECT BY PRIOR e.emp_no = e.m
       if (texts.join(' | ') !== 'e.dept_id = d.id(+) | d.loc_id = l.id (+)') throw new Error(texts.join(' | '));
     },
   },
+  // MySQL の書き方で、Oracle では書けないもの。SQL パーサーは読めるので、受け付けると Oracle では動かない SQL を説明してしまう
+  ...(
+    [
+      ['LIMIT（行制限句は FETCH FIRST）', 'SELECT * FROM emp ORDER BY id LIMIT 5, 10', '「LIMIT」は Oracle にありません'],
+      ['サブクエリの LIMIT', 'SELECT * FROM emp e WHERE e.id IN (SELECT id FROM x LIMIT 1)', '「LIMIT」は Oracle にありません'],
+      ['DELETE の LIMIT', 'DELETE FROM emp LIMIT 10', '「LIMIT」は Oracle の DELETE にありません'],
+      ['UPDATE の ORDER BY', 'UPDATE emp e SET e.sal = 0 ORDER BY e.id', '「ORDER BY」は Oracle の UPDATE にありません'],
+      ['UPDATE の表の後ろの JOIN', 'UPDATE emp e JOIN dept d ON d.id = e.dept_id SET e.sal = 0', '「JOIN」は、Oracle の UPDATE では'],
+      ['バッククォートの名前', 'SELECT `id` FROM emp', '「`」は Oracle では使えません'],
+      ['<=>', 'SELECT e.id FROM emp e WHERE e.a <=> 1', '「<=>」は Oracle にありません'],
+      ['表の別名の前の AS', 'SELECT e.id FROM emp e JOIN dept AS d ON d.id = e.dept_id', '「AS」は、Oracle では表の別名の前に書けません'],
+      ['インラインビューの別名の前の AS', 'SELECT v.id FROM (SELECT id FROM emp) AS v', '「AS」は、Oracle では表の別名の前に書けません'],
+      ['USING の列に表の名前を付ける（ORA-25154）', 'SELECT * FROM emp JOIN dept USING (dept_id) WHERE emp.dept_id = 10', 'USING で結合した列なので'],
+      ['NATURAL JOIN と USING', 'SELECT * FROM emp e NATURAL JOIN dept d USING (dept_id)', 'NATURAL JOIN には、ON も USING も書けません'],
+      ['WHERE の集約関数（ORA-00934）', 'SELECT e.dept_id FROM emp e WHERE COUNT(*) > 1', '集約関数は WHERE に書けません'],
+      ['WHERE の分析関数', 'SELECT e.id FROM emp e WHERE ROW_NUMBER() OVER (ORDER BY e.id) = 1', '分析関数（OVER (…)）は WHERE に書けません'],
+    ] as const
+  ).map(([what, sql, errorContains]) => ({
+    name: `Oracle: MySQL の書き方（${what}）はエラーにする`,
+    category: 'error' as const,
+    sql,
+    expectSuccess: false,
+    errorContains,
+  })),
+  {
+    name: 'Oracle: LIMIT という名前の列、WHERE のサブクエリの集約、列の別名の AS、AS OF は読む',
+    category: 'oracle',
+    sql: "SELECT t.limit AS lim FROM emp AS OF TIMESTAMP SYSTIMESTAMP t WHERE t.sal > (SELECT MAX(x.sal) FROM emp x) AND t.limit = 1",
+    expectSuccess: true,
+  },
   {
     name: 'Oracle: LISTAGG の ON OVERFLOW は、余分な「,」ではなく未対応の句としてエラーにする',
     category: 'error',

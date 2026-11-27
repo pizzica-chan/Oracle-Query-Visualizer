@@ -1217,7 +1217,8 @@ describe('集合演算の結果全体に掛かる後処理', () => {
     const parsed = parseOracleQuery('SELECT DISTINCT x FROM t1 UNION ALL SELECT y FROM t2 ORDER BY 1 DESC FETCH FIRST 3 ROWS ONLY');
     if (!parsed.success) throw new Error(parsed.error.message);
     const effect = buildUnionQueryEffect(parsed.query, 'japanese');
-    expect(effect?.wholeResult?.lines?.map((l) => l.text)).toEqual(['並び順 — 1 DESC', '件数上限 — 最大 3 行']);
+    // 集合演算の結果の列の位置は、最初のブランチの SELECT の列で数える
+    expect(effect?.wholeResult?.lines?.map((l) => l.text)).toEqual(['並び順 — 1 DESC（SELECT の 1 列目: x）', '件数上限 — 最大 3 行']);
     expect(effect?.branches.every((b) => !b.effect.summary.includes('最大'))).toBe(true);
   });
 
@@ -1317,6 +1318,23 @@ describe('ROWNUM の条件', () => {
     // 行をクリックすると、SQL の中の指定を選ぶ
     const written = line!.text.split(' の ')[1]!.split(' — ')[0]!;
     expect(sql.slice(line!.sourceSpan!.start, line!.sourceSpan!.end)).toBe(written);
+  });
+
+  it('ORDER BY の列の位置は、SELECT の何列目かを書き添え、GROUP BY の整数は既定では値として読むと書く', () => {
+    const result = parseOracleQuery('SELECT e.dept_id, COUNT(*) c FROM emp e GROUP BY 1 ORDER BY 2 DESC NULLS LAST, 1 + 0');
+    if (!result.success) throw new Error(result.error.message);
+    const texts = buildQueryEffect(result.query, 'japanese').sections.flatMap((s) => s.lines ?? []).map((l) => l.text);
+    expect(texts).toContain('並び順 — 2 DESC NULLS LAST（SELECT の 2 列目: c）, 1 + 0');
+    expect(texts.find((t) => t.startsWith('1 ごとに集約'))).toContain('既定では列の位置ではなく数値の 1 として読む');
+  });
+
+  it('1 つのコメントに並べたヒントは、一覧にあるものを 1 つずつ説明する', () => {
+    const result = parseOracleQuery('SELECT /*+ LEADING(e) USE_NL(d) NO_UNNEST */ e.id FROM emp e JOIN dept d ON d.id = e.dept_id');
+    if (!result.success) throw new Error(result.error.message);
+    const texts = buildQueryEffect(result.query, 'japanese').sections.flatMap((s) => s.lines ?? []).map((l) => l.text);
+    expect(texts).toContain(
+      'ヒント /*+ LEADING(e) USE_NL(d) NO_UNNEST */ — 実行計画への指示（結果集合は変わらない）。LEADING(e) は指定したテーブルから結合を開始する、USE_NL(d) はネステッドループ結合を選ばせる',
+    );
   });
 
   it('ORDER SIBLINGS BY は、階層の順を保って同じ親の行どうしを並べると書く', () => {

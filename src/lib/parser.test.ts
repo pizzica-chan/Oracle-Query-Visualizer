@@ -298,11 +298,13 @@ describe('parseOracleQuery', () => {
     });
   });
 
-  it('バッククォート付き列参照を正しく文字列化する', () => {
-    const result = parseOracleQuery('SELECT `u`.`id`, `u`.`name` FROM users u');
-    expect(result.success).toBe(true);
-    if (!result.success) return;
-    expect(result.query.columns.map((c) => c.expression)).toEqual(['u.id', 'u.name']);
+  it('バッククォートの名前は MySQL の書き方なので、位置を示してエラーにする', () => {
+    const sql = 'SELECT `u`.`id`, `u`.`name` FROM users u';
+    const result = parseOracleQuery(sql);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.message).toBe('1 行 8 列の「`」は Oracle では使えません。名前を囲むなら「"」で囲んでください');
+    expect(sql.slice(result.error.span!.start, result.error.span!.end)).toBe('`');
   });
 });
 

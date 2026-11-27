@@ -179,7 +179,7 @@ function describePostProcessLinesJapanese(query: ParsedQuery): EffectLine[] {
   const distinctLine = describeDistinctLineJapanese(query);
   if (distinctLine) lines.push({ text: distinctLine });
   if (query.orderBy.length > 0) {
-    const items = query.orderBy.map((o) => o.text).join(', ');
+    const items = query.orderBy.map((o) => orderByItemText(o.text, query)).join(', ');
     // 階層問い合わせの ORDER BY は、CONNECT BY が作った階層の順を置き換える。階層の順を保つには ORDER SIBLINGS BY を使い、
     // 同じ親の行どうしだけを並べる（Oracle Database 19c SQL Language Reference「Hierarchical Queries」: If you want to
     // order rows of siblings of the same parent, then use the ORDER SIBLINGS BY clause / ORDER BY … will override the
@@ -242,6 +242,26 @@ function formatLimitSummary(query: ParsedQuery): string {
   return '';
 }
 
+/** ORDER BY の項目が、SELECT の列の位置（`ORDER BY 2`）なら、その列を書き添える */
+function orderByItemText(item: string, query: ParsedQuery): string {
+  const position = /^\s*(\d+)(?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?\s*$/i.exec(item);
+  if (!position) return item;
+  const column = query.columns[Number(position[1]) - 1];
+  // SELECT の列の位置で並べる（Oracle Database 23 SQL Language Reference の SELECT、order_by_clause の position）
+  return column ? `${item}（SELECT の ${position[1]} 列目: ${column.alias ?? column.expression}）` : item;
+}
+
+/**
+ * GROUP BY の項目が整数なら、位置ではなく値として読む。GROUP_BY_POSITION_ENABLED（既定は FALSE。26ai から）が TRUE のときだけ、
+ * SELECT の列の位置になる（Oracle Database Reference「GROUP_BY_POSITION_ENABLED」）。値として読むと、どの行も同じ値なので 1 つのグループになる
+ */
+function groupByPositionNote(query: ParsedQuery): string {
+  const position = query.groupBy.find((g) => /^\s*\d+\s*$/.test(g.text));
+  if (!position) return '';
+  const n = position.text.trim();
+  return `（GROUP BY の ${n} は、既定では列の位置ではなく数値の ${n} として読むので、ほかに列が無ければすべての行が 1 つのグループになる。GROUP_BY_POSITION_ENABLED を TRUE にすると、SELECT の ${n} 列目でまとめる）`;
+}
+
 function describeAggregateLinesJapanese(query: ParsedQuery): EffectLine[] {
   if (query.statementType !== 'SELECT') return [];
 
@@ -251,7 +271,7 @@ function describeAggregateLinesJapanese(query: ParsedQuery): EffectLine[] {
 
   if (query.groupBy.length > 0) {
     lines.push({
-      text: `${query.groupBy.map((g) => g.text).join(', ')} ごとに集約 — 1グループ = 結果の1行`,
+      text: `${query.groupBy.map((g) => g.text).join(', ')} ごとに集約 — 1グループ = 結果の1行${groupByPositionNote(query)}`,
       sourceSpan: query.groupBy[0]?.sourceSpan,
     });
     // ROLLUP と CUBE は、グループごとの行に加えて小計の行を作る。書かないと、結果の行がグループの数より多い理由が分からない
@@ -1203,33 +1223,47 @@ function describeRowFilterSection(query: ParsedQuery, mode: QueryEffectMode): Qu
 
 /** よく使うヒントの意味。一覧に無いものはヒント本文をそのまま見せる */
 const HINT_DESCRIPTIONS: Array<{ pattern: RegExp; text: string }> = [
-  { pattern: /^ORDERED/i, text: 'FROM 句の記述順で結合する' },
-  { pattern: /^LEADING/i, text: '指定したテーブルから結合を開始する' },
-  { pattern: /^USE_NL/i, text: 'ネステッドループ結合を選ばせる' },
-  { pattern: /^USE_HASH/i, text: 'ハッシュ結合を選ばせる' },
-  { pattern: /^USE_MERGE/i, text: 'ソートマージ結合を選ばせる' },
-  { pattern: /^FULL/i, text: '全表走査を選ばせる' },
-  { pattern: /^INDEX(?:_[A-Z]+)?/i, text: '指定した索引を使わせる' },
-  { pattern: /^NO_INDEX/i, text: '指定した索引を使わせない' },
-  { pattern: /^PARALLEL/i, text: 'パラレル実行させる' },
-  { pattern: /^FIRST_ROWS/i, text: '先頭行を早く返す実行計画を選ばせる' },
-  { pattern: /^ALL_ROWS/i, text: '全行取得のスループットを優先させる' },
-  { pattern: /^APPEND/i, text: 'ダイレクトパス挿入させる' },
-  { pattern: /^MATERIALIZE/i, text: 'WITH 句の結果を一時表に実体化させる' },
-  { pattern: /^INLINE/i, text: 'WITH 句の結果を実体化せず展開させる' },
+  { pattern: /^ORDERED\b/i, text: 'FROM 句の記述順で結合する' },
+  { pattern: /^LEADING\b/i, text: '指定したテーブルから結合を開始する' },
+  { pattern: /^USE_NL\b/i, text: 'ネステッドループ結合を選ばせる' },
+  { pattern: /^USE_HASH\b/i, text: 'ハッシュ結合を選ばせる' },
+  { pattern: /^USE_MERGE\b/i, text: 'ソートマージ結合を選ばせる' },
+  { pattern: /^FULL\b/i, text: '全表走査を選ばせる' },
+  { pattern: /^INDEX(?:_[A-Z]+)?\b/i, text: '指定した索引を使わせる' },
+  { pattern: /^NO_INDEX\b/i, text: '指定した索引を使わせない' },
+  { pattern: /^PARALLEL\b/i, text: 'パラレル実行させる' },
+  { pattern: /^FIRST_ROWS\b/i, text: '先頭行を早く返す実行計画を選ばせる' },
+  { pattern: /^ALL_ROWS\b/i, text: '全行取得のスループットを優先させる' },
+  { pattern: /^APPEND\b/i, text: 'ダイレクトパス挿入させる' },
+  { pattern: /^MATERIALIZE\b/i, text: 'WITH 句の結果を一時表に実体化させる' },
+  { pattern: /^INLINE\b/i, text: 'WITH 句の結果を実体化せず展開させる' },
 ];
 
-function describeHint(text: string): string {
-  const matched = HINT_DESCRIPTIONS.find((entry) => entry.pattern.test(text));
-  return matched ? `${text} — ${matched.text}` : text;
+/** 1 つのコメントに並べたヒント（`LEADING(e) USE_NL(d) FULL(e)`）を、1 つずつに分ける */
+const HINT_ITEM_RE = /[A-Za-z_][\w$#]*(?:\s*\((?:[^()]|\([^()]*\))*\))?/g;
+
+/**
+ * 一覧にあるヒントの意味を「LEADING(e) は指定したテーブルから結合を開始する」の形で並べる。
+ * 一覧に無いヒントは書かない（ヒント全体はコメントのとおりに見せている）
+ */
+function describeHintItems(text: string): string {
+  const items = text.match(HINT_ITEM_RE) ?? [];
+  return items
+    .map((item) => {
+      const matched = HINT_DESCRIPTIONS.find((entry) => entry.pattern.test(item));
+      return matched ? `${item.replace(/\s+/g, ' ')} は${matched.text}` : '';
+    })
+    .filter(Boolean)
+    .join('、');
 }
 
 /** ヒントは実行計画への指示であって、結果集合そのものは変えない */
 function pushOptimizerHintLines(lines: EffectLine[], query: ParsedQuery): void {
   if (!query.hints?.length) return;
   for (const hint of query.hints) {
+    const meanings = describeHintItems(hint.text);
     lines.push({
-      text: `ヒント /*+ ${describeHint(hint.text)} */ — 実行計画への指示（結果集合は変わらない）`,
+      text: `ヒント /*+ ${hint.text} */ — 実行計画への指示（結果集合は変わらない）${meanings ? `。${meanings}` : ''}`,
       sourceSpan: hint.sourceSpan,
     });
   }
